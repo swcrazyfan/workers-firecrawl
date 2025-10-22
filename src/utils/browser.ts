@@ -29,9 +29,9 @@ export async function createPage(browser: Browser) {
   // Set default viewport
   await page.setViewport({ width: 1920, height: 1080 });
   
-  // Set default user agent
+  // Set default user agent that identifies as a bot
   await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
   );
   
   return page;

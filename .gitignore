@@ -132,3 +132,6 @@ dist
 .wrangler
 .idea
 assets/styles.css
+
+#things with sensitive info
+test-crawl.sh

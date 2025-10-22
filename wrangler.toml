@@ -10,3 +10,28 @@ enabled = true
 
 [browser]
 binding = "BROWSER"
+
+# D1 database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "workers-firecrawl"
+database_id = "637dfc08-e6e8-490f-ba9c-8c452168709f" # Will be updated after creating the database
+
+# Durable Objects binding
+[[durable_objects.bindings]]
+name = "CRAWL_JOBS"
+class_name = "CrawlJob"
+
+# Durable Objects migrations
+[[migrations]]
+tag = "v1"
+new_classes = [ "CrawlJob" ]
+
+# Custom domain configuration
+[[routes]]
+pattern = "crawl.joshhost.com"
+custom_domain = true
+
+# Scheduled trigger for cleanup
+[triggers]
+crons = ["0 * * * *"]  # Every hour
