@@ -306,6 +306,40 @@ export const ErrorResponseSchema = z.object({
   error: z.string(),
 });
 
+// Extract request schema (v2 API compatible)
+export const ExtractRequestSchema = z.object({
+  urls: z.array(z.string()).min(1),
+  prompt: z.string().optional(),
+  schema: z.any().optional(),
+  enableWebSearch: z.boolean().default(false).optional(),
+  scrapeOptions: CrawlScrapeOptionsSchema.optional(),
+  agent: z.object({
+    model: z.string().default("FIRE-1").optional(),
+    maxSteps: z.number().min(1).max(20).default(10).optional(),
+    timeout: z.number().default(300000).optional(),
+  }).optional(),
+}).refine(
+  (data) => data.prompt || data.schema,
+  { message: "Either 'prompt' or 'schema' must be provided" }
+);
+
+// Extract response schema
+export const ExtractResponseSchema = z.object({
+  success: z.boolean(),
+  id: z.string(),
+  url: z.string().optional(),
+});
+
+// Extract status response schema
+export const ExtractStatusResponseSchema = z.object({
+  success: z.boolean(),
+  status: z.enum(["processing", "completed", "failed", "cancelled"]),
+  data: z.any().optional(),
+  expiresAt: z.string().optional(),
+  tokensUsed: z.number().optional(),
+  error: z.string().optional(),
+});
+
 // Export types for TypeScript
 export type ScrapeRequest = z.infer<typeof ScrapeRequestSchema>;
 export type SearchRequest = z.infer<typeof SearchRequestSchema>;
@@ -314,6 +348,9 @@ export type SearchResponse = z.infer<typeof SearchResponseSchema>;
 export type CrawlRequest = z.infer<typeof CrawlRequestSchema>;
 export type CrawlResponse = z.infer<typeof CrawlResponseSchema>;
 export type CrawlStatusResponse = z.infer<typeof CrawlStatusResponseSchema>;
+export type ExtractRequest = z.infer<typeof ExtractRequestSchema>;
+export type ExtractResponse = z.infer<typeof ExtractResponseSchema>;
+export type ExtractStatusResponse = z.infer<typeof ExtractStatusResponseSchema>;
 export type Metadata = z.infer<typeof MetadataSchema>;
 export type BrowserAction = z.infer<typeof BrowserActionSchema>;
 export type ScreenshotOptions = z.infer<typeof ScreenshotOptionsSchema>;

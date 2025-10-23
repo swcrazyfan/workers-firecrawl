@@ -31,8 +31,12 @@ export class CrawlJob {
     switch (url.pathname) {
       case "/start":
         return this.handleStart(request);
+      case "/start-extract":
+        return this.handleStartExtract(request);
       case "/status":
         return this.handleStatus();
+      case "/status-extract":
+        return this.handleExtractStatus();
       default:
         return new Response("Not Found", { status: 404 });
     }
@@ -87,6 +91,228 @@ export class CrawlJob {
     `).bind(this.jobId).first();
     
     return Response.json(job);
+  }
+
+  async handleStartExtract(request: Request): Promise<Response> {
+    const body = await request.json() as any;
+    const { jobId, urls, prompt, schema, enableWebSearch, scrapeOptions, agent } = body;
+    
+    this.jobId = jobId;
+    this.options = {
+      url: urls[0], // Use first URL as base
+      limit: urls.length,
+      scrapeOptions: scrapeOptions || {},
+      maxDiscoveryDepth: 1, // Don't discover new links for extract
+      crawlEntireDomain: false,
+      allowSubdomains: false,
+      allowExternalLinks: enableWebSearch || false,
+      includePaths: [],
+      excludePaths: [],
+      ignoreQueryParameters: false,
+      sitemap: 'skip',
+      delay: 0,
+      maxConcurrency: 3,
+    };
+    
+    // Store extract-specific options
+    await this.state.storage.put('extractPrompt', prompt);
+    await this.state.storage.put('extractSchema', schema);
+    await this.state.storage.put('extractAgent', agent);
+    
+    // Initialize job in D1
+    await this.env.DB.prepare(`
+      INSERT INTO jobs (id, url, status, options, total, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      jobId,
+      urls.join(','),
+      'processing',
+      JSON.stringify({ prompt, schema, enableWebSearch, agent }),
+      urls.length,
+      Date.now(),
+      Date.now() + (24 * 60 * 60 * 1000)
+    ).run();
+    
+    // Add all URLs to queue
+    for (const url of urls) {
+      await this.env.DB.prepare(`
+        INSERT INTO url_queue (job_id, url, depth, status, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(jobId, url, 0, 'pending', Date.now()).run();
+    }
+    
+    console.log(`Extract job ${jobId} initialized with ${urls.length} URLs`);
+    
+    // Start extraction
+    this.state.waitUntil(this.startExtraction());
+    
+    return Response.json({ success: true });
+  }
+
+  async handleExtractStatus(): Promise<Response> {
+    const job = await this.env.DB.prepare(`
+      SELECT * FROM jobs WHERE id = ?
+    `).bind(this.jobId).first();
+    
+    if (!job) {
+      return Response.json(
+        { success: false, error: "Job not found" },
+        { status: 404 }
+      );
+    }
+    
+    // Get all results
+    const results = await this.env.DB.prepare(`
+      SELECT * FROM results WHERE job_id = ? ORDER BY created_at
+    `).bind(this.jobId).all();
+    
+    // Aggregate JSON results
+    let extractedData: any = null;
+    
+    if (job.status === 'completed' && results.results.length > 0) {
+      const jsonResults = results.results
+        .map(result => result.json ? JSON.parse(result.json as string) : null)
+        .filter(json => json !== null);
+      
+      if (jsonResults.length === 1) {
+        extractedData = jsonResults[0];
+      } else if (jsonResults.length > 1) {
+        extractedData = jsonResults;
+      }
+    }
+    
+    return Response.json({
+      success: true,
+      status: job.status,
+      data: extractedData,
+      expiresAt: new Date(job.expires_at as number).toISOString(),
+      tokensUsed: job.status === 'completed' ? (job.completed as number) : undefined,
+      error: job.error as string | undefined,
+    });
+  }
+
+  async startExtraction(): Promise<void> {
+    // Similar to startCrawling but for extract jobs
+    const prompt = await this.state.storage.get('extractPrompt') as string;
+    const schema = await this.state.storage.get('extractSchema');
+    
+    let active = true;
+    while (active) {
+      const urlRecord = await this.env.DB.prepare(`
+        SELECT * FROM url_queue 
+        WHERE job_id = ? AND status = 'pending'
+        ORDER BY id
+        LIMIT 1
+      `).bind(this.jobId).first();
+      
+      if (!urlRecord) {
+        await this.completeExtraction();
+        break;
+      }
+      
+      await this.env.DB.prepare(`
+        UPDATE url_queue SET status = 'processing' WHERE id = ?
+      `).bind(urlRecord.id).run();
+      
+      try {
+        await this.processExtractUrl(urlRecord.url as string, prompt, schema);
+        
+        await this.env.DB.prepare(`
+          UPDATE url_queue SET status = 'completed' WHERE id = ?
+        `).bind(urlRecord.id).run();
+        
+      } catch (error) {
+        await this.env.DB.prepare(`
+          UPDATE url_queue SET status = 'failed' WHERE id = ?
+        `).bind(urlRecord.id).run();
+        
+        console.error(`Failed to extract from ${urlRecord.url}:`, error);
+      }
+    }
+  }
+
+  async processExtractUrl(url: string, prompt: string, schema: any): Promise<void> {
+    const browser = await getBrowser(this.env);
+    
+    try {
+      // Extract content with markdown
+      const result = await extractContent(browser, url, {
+        formats: ['markdown'],
+        onlyMainContent: this.options.scrapeOptions?.onlyMainContent,
+        timeout: this.options.scrapeOptions?.timeout,
+      });
+      
+      // Perform extraction using prompt and/or schema
+      if (result.markdown) {
+        try {
+          let extractionResult;
+          
+          if (schema) {
+            extractionResult = await extractStructuredData(
+              result.markdown,
+              { schema, prompt },
+              this.env
+            );
+          } else if (prompt) {
+            extractionResult = await extractWithPrompt(
+              result.markdown,
+              { prompt, outputFormat: 'json' },
+              this.env
+            );
+          }
+          
+          if (extractionResult && extractionResult.success) {
+            result.json = extractionResult.data;
+          }
+        } catch (error) {
+          console.warn(`Extraction failed for ${url}:`, error);
+        }
+      }
+      
+      // Store result
+      await this.env.DB.prepare(`
+        INSERT INTO results (job_id, url, markdown, html, raw_html, links, metadata, json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        this.jobId,
+        url,
+        result.markdown || null,
+        result.html || null,
+        result.rawHtml || null,
+        JSON.stringify(result.links || []),
+        JSON.stringify(result.metadata || {}),
+        result.json ? JSON.stringify(result.json) : null,
+        Date.now()
+      ).run();
+      
+      // Update job counters
+      await this.env.DB.prepare(`
+        UPDATE jobs SET completed = completed + 1 WHERE id = ?
+      `).bind(this.jobId).run();
+      
+    } finally {
+      await closeBrowser(browser);
+    }
+  }
+
+  async completeExtraction(): Promise<void> {
+    console.log(`Completing extract job ${this.jobId}`);
+    await this.env.DB.prepare(`
+      UPDATE jobs SET 
+        status = 'completed',
+        completed_at = ?,
+        expires_at = ?
+      WHERE id = ?
+    `).bind(
+      Date.now(),
+      Date.now() + (24 * 60 * 60 * 1000),
+      this.jobId
+    ).run();
+    
+    // Set cleanup alarm
+    await this.state.storage.setAlarm(
+      Date.now() + (24 * 60 * 60 * 1000)
+    );
   }
 
   async initializeRobotsTxt(): Promise<void> {
@@ -219,23 +445,21 @@ export class CrawlJob {
 
       if (this.options.scrapeOptions?.formats) {
         for (const format of this.options.scrapeOptions.formats) {
+          if (typeof (format as any).type === 'string') {
+            if ((format as any).type === 'screenshot') {
+              formatTypes.push('screenshot');
+              screenshotOptions = { fullPage: (format as any).fullPage, quality: (format as any).quality };
+            }
+            if ((format as any).type === 'json') {
+              jsonFormat = format as any;
+              formatTypes.push('markdown');
+            }
+            if ((format as any).type === 'changeTracking') {
+              formatTypes.push('markdown');
+            }
+          }
           if (typeof format === 'string') {
             formatTypes.push(format);
-          } else if (typeof format === 'object' && 'type' in format) {
-            const formatObj = format as any;
-            if (formatObj.type === 'screenshot') {
-              formatTypes.push('screenshot');
-              screenshotOptions = {
-                fullPage: formatObj.fullPage,
-                quality: formatObj.quality,
-              };
-            } else if (formatObj.type === 'json') {
-              // Store JSON format for later processing
-              jsonFormat = formatObj;
-              formatTypes.push('markdown'); // Need markdown for extraction
-            } else if (formatObj.type === 'changeTracking') {
-              formatTypes.push('markdown'); // Fallback to markdown
-            }
           }
         }
       }

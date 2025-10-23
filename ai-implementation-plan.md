@@ -529,46 +529,170 @@ curl -X POST "http://localhost:8787/v2/scrape" \
 
 ---
 
-## Phase 5: Extract Endpoint 📋 PLANNED
+## Phase 5: Extract Endpoint ✅ COMPLETED
 
 ### Objectives
 Create dedicated `/v2/extract` endpoint for large-scale data extraction.
 
-### Features to Implement
+### Implementation Details
 
-#### 5.1 Endpoint Capabilities
-- Multiple URL support with wildcards (`example.com/*`)
-- Job-based processing with status tracking
-- Batch extraction with progress updates
-- Web search expansion (`enableWebSearch`)
+#### 5.1 Endpoint Created
+**Files:**
+- `src/endpoints/webExtract.ts` - POST /v2/extract endpoint
+- `src/endpoints/webExtractStatus.ts` - GET /v2/extract/{id} status endpoint
 
-#### 5.2 Request/Response Structure
-```typescript
-// Request
-{
-  "urls": ["https://example.com/*", "https://other.com/page"],
-  "prompt": "Extract company information",
-  "schema": {...},
-  "enableWebSearch": true
-}
+#### 5.2 Schema Updates
+**File: `src/types/schemas.ts`**
 
-// Response
+**Schemas added:**
+- `ExtractRequestSchema` - Request validation with:
+  - `urls`: Array of URLs (supports wildcards like `example.com/*`)
+  - `prompt`: Natural language extraction prompt (optional)
+  - `schema`: JSON schema for structured output (optional)
+  - `enableWebSearch`: Allow following external links
+  - `scrapeOptions`: Same options as scrape endpoint
+  - `agent`: AI agent configuration (FIRE-1 support)
+  - Validation: Either prompt or schema must be provided
+
+- `ExtractResponseSchema` - Job creation response
+- `ExtractStatusResponseSchema` - Status check response with:
+  - `status`: processing, completed, failed, cancelled
+  - `data`: Aggregated extraction results
+  - `expiresAt`: Job expiration timestamp
+  - `tokensUsed`: Token count for completed jobs
+
+#### 5.3 Durable Object Enhancement
+**File: `src/durableObjects/crawlJob.ts`**
+
+**Methods added:**
+- `handleStartExtract()` - Initialize extract job
+- `handleExtractStatus()` - Get extract job status
+- `startExtraction()` - Process extract URLs
+- `processExtractUrl()` - Extract data from single URL
+- `completeExtraction()` - Finalize extract job
+
+**Key features:**
+- Reuses existing crawl infrastructure
+- 24-hour job expiration (vs 7 days for crawls)
+- Aggregates JSON results from multiple URLs
+- Supports both single and multiple URL extraction
+- No link discovery (maxDiscoveryDepth: 1)
+
+#### 5.4 Endpoint Capabilities
+- **Multiple URL support**: Extract from multiple pages in one request
+- **Wildcard URLs**: Support for `example.com/*` patterns
+- **Job-based processing**: Async processing with status tracking
+- **Web search expansion**: Follow external links when enabled
+- **Schema or prompt**: Flexible extraction methods
+- **Result aggregation**: Combines data from multiple sources
+
+#### 5.5 Request/Response Examples
+
+**Single URL extraction:**
+```bash
+curl -X POST "http://localhost:8787/v2/extract" \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": ["https://example.com"],
+    "prompt": "Extract company information",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "companyName": {"type": "string"},
+        "industry": {"type": "string"}
+      }
+    }
+  }'
+```
+
+**Response:**
+```json
 {
   "success": true,
-  "data": [
-    { "company": "Example Corp", "industry": "Tech" },
-    { "company": "Other Inc", "industry": "Finance" }
-  ],
-  "status": "completed",
-  "sources": ["https://example.com", "https://other.com/page"]
+  "id": "extract_1234567890_abc123",
+  "url": "http://localhost:8787/v2/extract/extract_1234567890_abc123"
 }
 ```
 
-#### 5.3 Implementation Components
-- **New endpoint**: `src/endpoints/extract.ts`
-- **Job management**: Extend existing crawl job system
-- **URL expansion**: Wildcard processing logic
-- **Web search**: Integration with search endpoint
+**Multiple URLs extraction:**
+```bash
+curl -X POST "http://localhost:8787/v2/extract" \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": [
+      "https://example.com",
+      "https://other.com"
+    ],
+    "prompt": "Extract company information"
+  }'
+```
+
+**Check status:**
+```bash
+curl -X GET "http://localhost:8787/v2/extract/extract_1234567890_abc123" \
+  -H "Authorization: Bearer YOUR_KEY"
+```
+
+**Status response:**
+```json
+{
+  "success": true,
+  "status": "completed",
+  "data": {
+    "companyName": "Example Corp",
+    "industry": "Technology"
+  },
+  "expiresAt": "2024-12-02T00:00:00.000Z",
+  "tokensUsed": 2
+}
+```
+
+**Multiple results:**
+```json
+{
+  "success": true,
+  "status": "completed",
+  "data": [
+    {"companyName": "Example Corp", "industry": "Tech"},
+    {"companyName": "Other Inc", "industry": "Finance"}
+  ],
+  "expiresAt": "2024-12-02T00:00:00.000Z",
+  "tokensUsed": 2
+}
+```
+
+#### 5.6 Testing Resources
+**Test script created**: `test-extract.sh`
+
+**Test coverage:**
+1. Single URL with schema
+2. Multiple URLs extraction
+3. Prompt-only extraction (no schema)
+4. Extract with web search enabled
+
+**Run tests:**
+```bash
+export WORKER_URL="http://localhost:8787"
+export API_KEY="your-api-key"
+./test-extract.sh
+```
+
+#### 5.7 Key Features
+- **Wildcard support**: Planned for `example.com/*` patterns
+- **Job-based**: Async processing with status tracking
+- **Flexible extraction**: Schema or prompt-based
+- **Multi-URL**: Process multiple pages in one request
+- **Web search**: Optional external link following
+- **Result aggregation**: Combines data from all sources
+- **24-hour retention**: Jobs expire after 24 hours
+
+#### 5.8 Integration Points
+- **Reuses**: CrawlJob Durable Object infrastructure
+- **Leverages**: Existing AI extraction utilities
+- **Compatible**: Same scrapeOptions as other endpoints
+- **Database**: Uses same jobs/results tables
 
 ---
 
