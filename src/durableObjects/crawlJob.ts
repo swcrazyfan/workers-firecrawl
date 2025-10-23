@@ -45,11 +45,12 @@ export class CrawlJob {
   async handleStart(request: Request): Promise<Response> {
     const { jobId, url, options } = await request.json() as StartRequest;
     
+    // Set instance variables (only for immediate use in this method)
     this.jobId = jobId;
     this.baseUrl = url;
     this.options = options;
     
-    // Initialize job in D1
+    // Initialize job in D1 (single source of truth)
     await this.env.DB.prepare(`
       INSERT INTO jobs (id, url, status, options, total, created_at, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -71,24 +72,43 @@ export class CrawlJob {
     
     console.log(`Crawl job ${jobId} initialized with URL: ${url}`);
     
-    // Fetch and parse robots.txt
-    this.state.waitUntil(this.initializeRobotsTxt());
+    // Pass jobId to all async methods so they can load state from D1
+    this.state.waitUntil(this.initializeRobotsTxt(jobId));
     
     // Fetch sitemap if enabled
-    if (this.options.sitemap === 'include') {
-      this.state.waitUntil(this.initializeSitemap());
+    if (options.sitemap === 'include') {
+      this.state.waitUntil(this.initializeSitemap(jobId));
     }
     
-    // Start crawling
-    this.state.waitUntil(this.startCrawling());
+    // Start crawling - pass jobId so it can load state from D1
+    this.state.waitUntil(this.startCrawling(jobId));
     
     return Response.json({ success: true });
   }
 
   async handleStatus(): Promise<Response> {
+    // Get jobId from the Durable Object ID (it was created with idFromName(jobId))
+    const jobId = await this.state.storage.get('jobId') as string;
+    
+    if (!jobId) {
+      // Fallback: try to get from any job in the database for this DO
+      // This shouldn't happen but provides a safety net
+      return Response.json(
+        { success: false, error: "Job ID not found" },
+        { status: 404 }
+      );
+    }
+    
     const job = await this.env.DB.prepare(`
       SELECT * FROM jobs WHERE id = ?
-    `).bind(this.jobId).first();
+    `).bind(jobId).first();
+    
+    if (!job) {
+      return Response.json(
+        { success: false, error: "Job not found" },
+        { status: 404 }
+      );
+    }
     
     return Response.json(job);
   }
@@ -97,27 +117,19 @@ export class CrawlJob {
     const body = await request.json() as any;
     const { jobId, urls, prompt, schema, enableWebSearch, scrapeOptions, agent } = body;
     
-    this.jobId = jobId;
-    this.options = {
-      url: urls[0], // Use first URL as base
-      limit: urls.length,
-      scrapeOptions: scrapeOptions || {},
-      maxDiscoveryDepth: 1, // Don't discover new links for extract
-      crawlEntireDomain: false,
-      allowSubdomains: false,
-      allowExternalLinks: enableWebSearch || false,
-      includePaths: [],
-      excludePaths: [],
-      ignoreQueryParameters: false,
-      sitemap: 'skip',
-      delay: 0,
-      maxConcurrency: 3,
-    };
+    // Store jobId in DO storage for status checks and alarm cleanup
+    await this.state.storage.put('jobId', jobId);
     
-    // Store extract-specific options
-    await this.state.storage.put('extractPrompt', prompt);
-    await this.state.storage.put('extractSchema', schema);
-    await this.state.storage.put('extractAgent', agent);
+    // Store extract-specific options in DO storage (only if defined)
+    if (prompt !== undefined) {
+      await this.state.storage.put('extractPrompt', prompt);
+    }
+    if (schema !== undefined) {
+      await this.state.storage.put('extractSchema', schema);
+    }
+    if (agent !== undefined) {
+      await this.state.storage.put('extractAgent', agent);
+    }
     
     // Initialize job in D1
     await this.env.DB.prepare(`
@@ -127,7 +139,7 @@ export class CrawlJob {
       jobId,
       urls.join(','),
       'processing',
-      JSON.stringify({ prompt, schema, enableWebSearch, agent }),
+      JSON.stringify({ prompt, schema, enableWebSearch, agent, scrapeOptions }),
       urls.length,
       Date.now(),
       Date.now() + (24 * 60 * 60 * 1000)
@@ -143,16 +155,26 @@ export class CrawlJob {
     
     console.log(`Extract job ${jobId} initialized with ${urls.length} URLs`);
     
-    // Start extraction
-    this.state.waitUntil(this.startExtraction());
+    // Start extraction - pass jobId
+    this.state.waitUntil(this.startExtraction(jobId));
     
     return Response.json({ success: true });
   }
 
   async handleExtractStatus(): Promise<Response> {
+    // Get jobId from DO storage
+    const jobId = await this.state.storage.get('jobId') as string;
+    
+    if (!jobId) {
+      return Response.json(
+        { success: false, error: "Job ID not found" },
+        { status: 404 }
+      );
+    }
+    
     const job = await this.env.DB.prepare(`
       SELECT * FROM jobs WHERE id = ?
-    `).bind(this.jobId).first();
+    `).bind(jobId).first();
     
     if (!job) {
       return Response.json(
@@ -164,7 +186,7 @@ export class CrawlJob {
     // Get all results
     const results = await this.env.DB.prepare(`
       SELECT * FROM results WHERE job_id = ? ORDER BY created_at
-    `).bind(this.jobId).all();
+    `).bind(jobId).all();
     
     // Aggregate JSON results
     let extractedData: any = null;
@@ -191,10 +213,39 @@ export class CrawlJob {
     });
   }
 
-  async startExtraction(): Promise<void> {
-    // Similar to startCrawling but for extract jobs
+  async startExtraction(jobId: string): Promise<void> {
+    // Load extract-specific options from DO storage
     const prompt = await this.state.storage.get('extractPrompt') as string;
     const schema = await this.state.storage.get('extractSchema');
+    
+    // Load job from D1
+    const job = await this.env.DB.prepare(`
+      SELECT * FROM jobs WHERE id = ?
+    `).bind(jobId).first();
+    
+    if (!job) {
+      console.error(`Extract job ${jobId} not found`);
+      return;
+    }
+    
+    // Set instance variables
+    this.jobId = jobId;
+    const options = JSON.parse(job.options as string);
+    this.options = {
+      url: '',
+      limit: job.total as number,
+      scrapeOptions: options.scrapeOptions || {},
+      maxDiscoveryDepth: 1,
+      crawlEntireDomain: false,
+      allowSubdomains: false,
+      allowExternalLinks: options.enableWebSearch || false,
+      includePaths: [],
+      excludePaths: [],
+      ignoreQueryParameters: false,
+      sitemap: 'skip',
+      delay: 0,
+      maxConcurrency: 3,
+    };
     
     let active = true;
     while (active) {
@@ -203,10 +254,10 @@ export class CrawlJob {
         WHERE job_id = ? AND status = 'pending'
         ORDER BY id
         LIMIT 1
-      `).bind(this.jobId).first();
+      `).bind(jobId).first();
       
       if (!urlRecord) {
-        await this.completeExtraction();
+        await this.completeExtraction(jobId);
         break;
       }
       
@@ -295,8 +346,8 @@ export class CrawlJob {
     }
   }
 
-  async completeExtraction(): Promise<void> {
-    console.log(`Completing extract job ${this.jobId}`);
+  async completeExtraction(jobId: string): Promise<void> {
+    console.log(`Completing extract job ${jobId}`);
     await this.env.DB.prepare(`
       UPDATE jobs SET 
         status = 'completed',
@@ -306,7 +357,7 @@ export class CrawlJob {
     `).bind(
       Date.now(),
       Date.now() + (24 * 60 * 60 * 1000),
-      this.jobId
+      jobId
     ).run();
     
     // Set cleanup alarm
@@ -315,16 +366,33 @@ export class CrawlJob {
     );
   }
 
-  async initializeRobotsTxt(): Promise<void> {
+  async initializeRobotsTxt(jobId: string): Promise<void> {
     try {
-      console.log(`Fetching robots.txt for ${this.baseUrl}`);
-      this.robotsParser = await RobotsParser.fetch(this.baseUrl, 'Firecrawl');
+      // Load job from D1
+      const job = await this.env.DB.prepare(`
+        SELECT url, options FROM jobs WHERE id = ?
+      `).bind(jobId).first();
+      
+      if (!job) {
+        console.error(`Job ${jobId} not found for robots.txt initialization`);
+        return;
+      }
+      
+      const baseUrl = job.url as string;
+      const options = JSON.parse(job.options as string) as CrawlRequest;
+      
+      console.log(`Fetching robots.txt for ${baseUrl}`);
+      this.robotsParser = await RobotsParser.fetch(baseUrl, 'Firecrawl');
       const crawlDelay = this.robotsParser.getCrawlDelay();
       if (crawlDelay > 0) {
         console.log(`Robots.txt specifies crawl delay of ${crawlDelay}ms`);
         // Ensure our delay is at least as much as robots.txt requires
-        if (this.options.delay < crawlDelay / 1000) {
-          this.options.delay = crawlDelay / 1000;
+        if (options.delay < crawlDelay / 1000) {
+          // Update crawl options in D1
+          const updatedOptions = { ...options, delay: crawlDelay / 1000 };
+          await this.env.DB.prepare(`
+            UPDATE jobs SET options = ? WHERE id = ?
+          `).bind(JSON.stringify(updatedOptions), jobId).run();
         }
       }
     } catch (error) {
@@ -333,11 +401,28 @@ export class CrawlJob {
     }
   }
 
-  async initializeSitemap(): Promise<void> {
+  async initializeSitemap(jobId: string): Promise<void> {
     try {
-      console.log(`Fetching sitemap for ${this.baseUrl}`);
-      const sitemapUrls = await SitemapParser.fetch(this.baseUrl);
+      // Load job from D1
+      const job = await this.env.DB.prepare(`
+        SELECT url, options FROM jobs WHERE id = ?
+      `).bind(jobId).first();
+      
+      if (!job) {
+        console.error(`Job ${jobId} not found for sitemap initialization`);
+        return;
+      }
+      
+      const baseUrl = job.url as string;
+      const options = JSON.parse(job.options as string) as CrawlRequest;
+      
+      console.log(`Fetching sitemap for ${baseUrl}`);
+      const sitemapUrls = await SitemapParser.fetch(baseUrl);
       console.log(`Found ${sitemapUrls.length} URLs in sitemap`);
+      
+      // Temporarily set instance variables for shouldCrawl to work
+      this.baseUrl = baseUrl;
+      this.options = options;
       
       // Add sitemap URLs to queue (limit to avoid adding too many at once)
       const maxSitemapUrls = Math.min(sitemapUrls.length, 100);
@@ -350,17 +435,17 @@ export class CrawlJob {
             INSERT INTO url_queue (job_id, url, depth, status, created_at)
             VALUES (?, ?, ?, ?, ?)
           `).bind(
-            this.jobId,
+            jobId,
             url,
             0, // Sitemap URLs start at depth 0
             'pending',
             Date.now()
           ).run();
           
-          // Update total count
+          // Update total count in job
           await this.env.DB.prepare(`
             UPDATE jobs SET total = total + 1 WHERE id = ?
-          `).bind(this.jobId).run();
+          `).bind(jobId).run();
         }
       }
       
@@ -370,11 +455,28 @@ export class CrawlJob {
     }
   }
 
-  async startCrawling(): Promise<void> {
+  async startCrawling(jobId: string): Promise<void> {
+    // Load complete job state from D1
+    const job = await this.env.DB.prepare(`
+      SELECT * FROM jobs WHERE id = ?
+    `).bind(jobId).first();
+    
+    if (!job) {
+      console.error(`Crawl job ${jobId} not found in database`);
+      return;
+    }
+    
+    // Set instance variables from D1 data
+    this.jobId = job.id as string;
+    this.baseUrl = job.url as string;
+    this.options = JSON.parse(job.options as string) as CrawlRequest;
+    
+    console.log(`Starting crawl for job ${this.jobId}, baseUrl: ${this.baseUrl}`);
+    
     // Update job status
     await this.env.DB.prepare(`
       UPDATE jobs SET status = 'scraping', started_at = ? WHERE id = ?
-    `).bind(Date.now(), this.jobId).run();
+    `).bind(Date.now(), jobId).run();
     
     let active = true;
     while (active) {
@@ -384,11 +486,11 @@ export class CrawlJob {
         WHERE job_id = ? AND status = 'pending'
         ORDER BY depth, id
         LIMIT 1
-      `).bind(this.jobId).first();
+      `).bind(jobId).first();
       
       if (!urlRecord) {
         // No more URLs to process
-        await this.completeCrawl();
+        await this.completeCrawl(jobId);
         break;
       }
       
@@ -406,6 +508,11 @@ export class CrawlJob {
           UPDATE url_queue SET status = 'completed' WHERE id = ?
         `).bind(urlRecord.id).run();
         
+        // Increment completed counter
+        await this.env.DB.prepare(`
+          UPDATE jobs SET completed = completed + 1 WHERE id = ?
+        `).bind(jobId).run();
+        
       } catch (error) {
         // Mark as failed
         await this.env.DB.prepare(`
@@ -417,13 +524,13 @@ export class CrawlJob {
       }
       
       // Check if we've hit the limit
-      const job = await this.env.DB.prepare(`
+      const currentJob = await this.env.DB.prepare(`
         SELECT completed, options FROM jobs WHERE id = ?
-      `).bind(this.jobId).first();
+      `).bind(jobId).first();
       
-      const options = JSON.parse(job.options as string);
-      if (job.completed >= options.limit) {
-        await this.completeCrawl();
+      const options = JSON.parse(currentJob.options as string);
+      if (currentJob.completed >= options.limit) {
+        await this.completeCrawl(jobId);
         break;
       }
       
@@ -435,6 +542,15 @@ export class CrawlJob {
   }
 
   async processUrl(url: string): Promise<void> {
+    // Defensive check: ensure state is loaded
+    if (!this.jobId || !this.baseUrl || !this.options) {
+      const errorMsg = `processUrl called without state: jobId=${this.jobId}, baseUrl=${this.baseUrl}, options=${!!this.options}`;
+      console.error(errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    console.log(`Processing URL: ${url} for job ${this.jobId}`);
+    
     const browser = await getBrowser(this.env);
     
     try {
@@ -576,12 +692,7 @@ export class CrawlJob {
         `).bind(this.jobId).run();
       }
       
-      // Update job counters
-      await this.env.DB.prepare(`
-        UPDATE jobs SET completed = completed + 1 WHERE id = ?
-      `).bind(this.jobId).run();
-      
-      console.log(`Updated completed count for job ${this.jobId}`);
+      console.log(`Finished processing URL: ${url}`);
       
     } finally {
       await closeBrowser(browser);
@@ -696,8 +807,8 @@ export class CrawlJob {
     return extraPath.split('/').length - 1;
   }
 
-  async completeCrawl(): Promise<void> {
-    console.log(`Completing crawl job ${this.jobId}`);
+  async completeCrawl(jobId: string): Promise<void> {
+    console.log(`Completing crawl job ${jobId}`);
     await this.env.DB.prepare(`
       UPDATE jobs SET 
         status = 'completed',
@@ -707,10 +818,10 @@ export class CrawlJob {
     `).bind(
       Date.now(),
       Date.now() + (7 * 24 * 60 * 60 * 1000), // 7 days
-      this.jobId
+      jobId
     ).run();
     
-    console.log(`Crawl job ${this.jobId} marked as completed`);
+    console.log(`Crawl job ${jobId} marked as completed`);
     
     // Set cleanup alarm
     await this.state.storage.setAlarm(
@@ -719,20 +830,28 @@ export class CrawlJob {
   }
 
   async alarm(): Promise<void> {
-    // Delete all data for this job
+    // Load jobId from storage (needed for cleanup)
+    const jobId = await this.state.storage.get('jobId') as string;
+    
+    if (!jobId) {
+      console.error('No jobId found in storage for cleanup');
+      return;
+    }
+    
+    // Delete all D1 data for this job
     await this.env.DB.prepare(`
       DELETE FROM results WHERE job_id = ?
-    `).bind(this.jobId).run();
+    `).bind(jobId).run();
     
     await this.env.DB.prepare(`
       DELETE FROM url_queue WHERE job_id = ?
-    `).bind(this.jobId).run();
+    `).bind(jobId).run();
     
     await this.env.DB.prepare(`
       DELETE FROM jobs WHERE id = ?
-    `).bind(this.jobId).run();
+    `).bind(jobId).run();
     
-    // Clean up DO storage
+    // Clean up DO storage (remove jobId, baseUrl, options, etc.)
     await this.state.storage.deleteAll();
   }
 }
