@@ -675,6 +675,16 @@ export class CrawlJob {
       
       // Add new URLs to queue
       for (const newUrl of newUrls) {
+        // Check if URL already exists in queue to prevent duplicates
+        const existingUrl = await this.env.DB.prepare(`
+          SELECT id FROM url_queue WHERE job_id = ? AND url = ?
+        `).bind(this.jobId, newUrl).first();
+        
+        if (existingUrl) {
+          // URL already in queue, skip it
+          continue;
+        }
+        
         await this.env.DB.prepare(`
           INSERT INTO url_queue (job_id, url, depth, status, created_at)
           VALUES (?, ?, ?, ?, ?)

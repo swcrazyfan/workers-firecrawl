@@ -421,7 +421,7 @@ curl -X POST "https://api.firecrawl.dev/v2/extract" \
 
 ### Map (`/v2/map`)
 
-Get a complete list of URLs from any website quickly.
+Get a complete list of URLs from any website quickly. This endpoint prioritizes speed and may not capture all website links.
 
 #### Endpoint
 ```
@@ -433,10 +433,21 @@ POST /v2/map
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `url` | string | Yes | Website URL to map |
-| `includeSubdomains` | boolean | No | Include subdomains |
-| `search` | string | No | Filter URLs by search term |
-| `limit` | number | No | Maximum URLs to return |
-| `sitemap` | boolean | No | Use sitemap if available |
+| `search` | string | No | Keyword to filter URLs (simple string matching in URL path, ordered by relevance) |
+| `sitemap` | string | No | Sitemap mode: "skip", "include", or "only" (default: "include") |
+| `includeSubdomains` | boolean | No | Include subdomains (default: true) |
+| `ignoreQueryParameters` | boolean | No | Exclude URLs with query parameters (default: true) |
+| `limit` | number | No | Maximum URLs to return (default: 5000, max: 100000) |
+| `timeout` | number | No | Timeout in milliseconds (no timeout by default) |
+| `location` | object | No | Location settings (country, languages) |
+
+#### Sitemap Modes
+
+The `sitemap` parameter controls how sitemaps are used:
+
+- **`"include"`** (default) - Use sitemap + find other pages through crawling
+- **`"skip"`** - Ignore sitemap completely, only use crawling
+- **`"only"`** - Only return URLs found in sitemap
 
 #### Map Request
 
@@ -446,23 +457,107 @@ curl -X POST "https://api.firecrawl.dev/v2/map" \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://example.com",
+    "limit": 100,
+    "sitemap": "include",
     "includeSubdomains": false,
-    "limit": 100
+    "ignoreQueryParameters": true
   }'
 ```
 
 #### Map Response
 
+**Important**: The response returns an array of link objects with `url`, `title`, and `description` fields (not just URL strings).
+
 ```json
 {
   "success": true,
-  "data": [
-    "https://example.com/",
-    "https://example.com/about",
-    "https://example.com/contact",
-    "https://example.com/blog/post-1"
+  "links": [
+    {
+      "url": "https://example.com/",
+      "title": "Home Page",
+      "description": "Welcome to our website"
+    },
+    {
+      "url": "https://example.com/about",
+      "title": "About Us",
+      "description": "Learn more about our company"
+    },
+    {
+      "url": "https://example.com/contact",
+      "title": "Contact",
+      "description": "Get in touch with us"
+    }
   ]
 }
+```
+
+**Note**: `title` and `description` are not always present as it depends on the website.
+
+#### Map with Search (Keyword Filtering)
+
+The `search` parameter filters URLs using **simple keyword matching** in the URL path. Results are ordered by relevance (how prominently the keyword appears in the URL).
+
+**Example**: Search for URLs containing "blog":
+
+```bash
+curl -X POST "https://api.firecrawl.dev/v2/map" \
+  -H "Authorization: Bearer fc-YOUR-API-KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://firecrawl.dev",
+    "search": "blog"
+  }'
+```
+
+Response (ordered by relevance):
+```json
+{
+  "success": true,
+  "links": [
+    {
+      "url": "https://firecrawl.dev/blog",
+      "title": "Blog",
+      "description": "Latest updates"
+    },
+    {
+      "url": "https://firecrawl.dev/blog/post-1",
+      "title": "Blog Post 1",
+      "description": "First blog post"
+    }
+  ]
+}
+```
+
+**Note**: The search uses keyword matching in URLs, not semantic/embedding-based search.
+
+#### Map with Sitemap Only
+
+Return only URLs found in the sitemap:
+
+```bash
+curl -X POST "https://api.firecrawl.dev/v2/map" \
+  -H "Authorization: Bearer fc-YOUR-API-KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "sitemap": "only",
+    "limit": 1000
+  }'
+```
+
+#### Map with Location
+
+```bash
+curl -X POST "https://api.firecrawl.dev/v2/map" \
+  -H "Authorization: Bearer fc-YOUR-API-KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "location": {
+      "country": "US",
+      "languages": ["en"]
+    }
+  }'
 ```
 
 ## Common Parameters

@@ -3,6 +3,8 @@
  */
 
 export class SitemapParser {
+  private static readonly MAX_RECURSION_DEPTH = 3;
+
   /**
    * Fetch and parse sitemap URLs
    */
@@ -15,15 +17,16 @@ export class SitemapParser {
         `${urlObj.protocol}//${urlObj.host}/sitemaps.xml`
       ];
       
-      const urls: string[] = [];
+      const urlSet = new Set<string>();
+      const visitedSitemaps = new Set<string>();
       
       for (const sitemapUrl of sitemapUrls) {
         try {
           const response = await fetch(sitemapUrl);
           if (response.ok) {
             const content = await response.text();
-            const parsedUrls = this.parseSitemap(content, urlObj.origin);
-            urls.push(...parsedUrls);
+            visitedSitemaps.add(sitemapUrl);
+            await this.parseSitemapRecursive(content, urlObj.origin, urlSet, visitedSitemaps, 0);
             break; // Stop after finding a valid sitemap
           }
         } catch (error) {
@@ -32,7 +35,7 @@ export class SitemapParser {
         }
       }
       
-      return urls;
+      return Array.from(urlSet);
     } catch (error) {
       console.warn(`Failed to fetch sitemap for ${baseUrl}:`, error);
       return [];
@@ -40,34 +43,57 @@ export class SitemapParser {
   }
   
   /**
-   * Parse sitemap XML content
+   * Recursively parse sitemap XML content and fetch sub-sitemaps
    */
-  private static parseSitemap(content: string, baseUrl: string): string[] {
-    const urls: string[] = [];
-    
-    // Simple regex to extract URLs from sitemap
+  private static async parseSitemapRecursive(
+    content: string,
+    baseUrl: string,
+    urlSet: Set<string>,
+    visitedSitemaps: Set<string>,
+    depth: number
+  ): Promise<void> {
+    // Extract regular URLs from sitemap
     const urlRegex = /<url>\s*<loc>([^<]+)<\/loc>/g;
     let match;
     
     while ((match = urlRegex.exec(content)) !== null) {
       const url = match[1].trim();
       if (url && url.startsWith('http')) {
-        urls.push(url);
+        urlSet.add(url);
       }
     }
     
-    // Also check for sitemap index files
-    const sitemapIndexRegex = /<sitemap>\s*<loc>([^<]+)<\/loc>/g;
-    
-    while ((match = sitemapIndexRegex.exec(content)) !== null) {
-      const sitemapUrl = match[1].trim();
-      if (sitemapUrl && sitemapUrl.startsWith('http')) {
-        // This is a sub-sitemap, we could fetch it recursively
-        // For now, we'll just log it
-        console.log(`Found sub-sitemap: ${sitemapUrl}`);
+    // Check for sitemap index files and fetch them recursively
+    if (depth < this.MAX_RECURSION_DEPTH) {
+      const sitemapIndexRegex = /<sitemap>\s*<loc>([^<]+)<\/loc>/g;
+      const subSitemaps: string[] = [];
+      
+      while ((match = sitemapIndexRegex.exec(content)) !== null) {
+        const sitemapUrl = match[1].trim();
+        if (sitemapUrl && sitemapUrl.startsWith('http') && !visitedSitemaps.has(sitemapUrl)) {
+          subSitemaps.push(sitemapUrl);
+          visitedSitemaps.add(sitemapUrl);
+        }
       }
+      
+      // Fetch sub-sitemaps recursively
+      if (subSitemaps.length > 0) {
+        console.log(`Found ${subSitemaps.length} sub-sitemaps at depth ${depth}, fetching...`);
+        
+        for (const subSitemapUrl of subSitemaps) {
+          try {
+            const response = await fetch(subSitemapUrl);
+            if (response.ok) {
+              const subContent = await response.text();
+              await this.parseSitemapRecursive(subContent, baseUrl, urlSet, visitedSitemaps, depth + 1);
+            }
+          } catch (error) {
+            console.warn(`Failed to fetch sub-sitemap ${subSitemapUrl}:`, error);
+          }
+        }
+      }
+    } else {
+      console.log(`Max recursion depth (${this.MAX_RECURSION_DEPTH}) reached, stopping sitemap traversal`);
     }
-    
-    return urls;
   }
 }
