@@ -75,6 +75,7 @@ export class WebCrawlStatus extends OpenAPIRoute {
         rawHtml: result.raw_html,
         links: result.links ? JSON.parse(result.links as string) : [],
         metadata: result.metadata ? JSON.parse(result.metadata as string) : {},
+        json: result.json ? JSON.parse(result.json as string) : undefined,
         sourceURL: result.url,
       }));
       

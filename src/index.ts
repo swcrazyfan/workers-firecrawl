@@ -8,12 +8,20 @@ import { WebCrawlStatus } from "./endpoints/webCrawlStatus";
 import { getBrowser, closeBrowser } from "./utils/browser";
 import { analyzeImageSearchPage, analyzeNewsSearchPage } from "./utils/contentExtractor";
 import { CrawlJob } from "./durableObjects/crawlJob";
+// Add AI utilities
+import { checkAIAvailability, getAIConfigStatus } from "./utils/ai";
 
 export type Env = {
 	BROWSER: Fetcher;
 	AUTHORIZATION_KEY?: string;
 	CRAWL_JOBS: DurableObjectNamespace;
 	DB: D1Database;
+  // LLM config (OpenAI-compatible; defaults set in config)
+  OPENAI_API_KEY?: string;
+  LLM_BASE_URL?: string;
+  LLM_MODEL?: string;
+  LLM_TIMEOUT?: string;
+  LLM_MAX_RETRIES?: string;
 };
 export type AppContext = Context<{ Bindings: Env }>;
 
@@ -60,6 +68,38 @@ app.get("/debug/search", async (c) => {
     );
   } finally {
     await closeBrowser(browser);
+  }
+});
+
+// Add AI debug endpoint for config + availability diagnostics
+app.get("/debug/ai", async (c) => {
+  try {
+    // Validate configuration from environment
+    const configStatus = getAIConfigStatus(c.env as Env);
+
+    // Probe provider availability with a tiny request
+    const availability = await checkAIAvailability(c.env as Env);
+
+    return c.json({
+      success: true,
+      data: {
+        config: {
+          isValid: configStatus.isValid,
+          errors: configStatus.errors,
+          model: configStatus.model,
+          baseUrl: configStatus.baseUrl
+        },
+        availability
+      }
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: `AI debug failed: ${(error as Error).message}`
+      },
+      { status: 500 }
+    );
   }
 });
 

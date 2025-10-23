@@ -2,6 +2,7 @@ import { OpenAPIRoute, contentJson } from "chanfana";
 import type { AppContext } from "../index";
 import { getBrowser, closeBrowser } from "../utils/browser";
 import { extractContent } from "../utils/contentExtractor";
+import { extractStructuredData, extractWithPrompt } from "../utils/ai";
 import {
   ScrapeRequestSchema,
   ScrapeResponseSchema,
@@ -60,6 +61,7 @@ export class WebScrape extends OpenAPIRoute {
       // Extract format types from the formats array
       const formatTypes: string[] = [];
       let screenshotOptions: any = undefined;
+      let jsonOptions: { schema?: any; prompt?: string } | undefined;
 
       if (formats) {
         for (const format of formats) {
@@ -69,12 +71,16 @@ export class WebScrape extends OpenAPIRoute {
             if (format.type === 'screenshot') {
               formatTypes.push('screenshot');
               screenshotOptions = {
-                fullPage: format.fullPage,
-                quality: format.quality,
+                fullPage: (format as any).fullPage,
+                quality: (format as any).quality,
               };
             } else if (format.type === 'json') {
-              // JSON extraction would require LLM integration - not implemented yet
-              formatTypes.push('markdown'); // Fallback to markdown
+              // Store JSON options for later processing
+              formatTypes.push('json');
+              jsonOptions = {
+                schema: (format as any).schema,
+                prompt: (format as any).prompt
+              };
             } else if (format.type === 'changeTracking') {
               // Change tracking would require caching - not implemented yet
               formatTypes.push('markdown'); // Fallback to markdown
@@ -120,6 +126,51 @@ export class WebScrape extends OpenAPIRoute {
           adPatterns.forEach(pattern => {
             result.markdown = result.markdown.replace(pattern, '[Ad removed]');
           });
+        }
+
+        // Process JSON extraction if requested
+        if (jsonOptions && result.markdown) {
+          try {
+            let extractionResult;
+            
+            // Use schema-based extraction if schema is provided
+            if (jsonOptions.schema) {
+              extractionResult = await extractStructuredData(
+                result.markdown,
+                {
+                  schema: jsonOptions.schema,
+                  prompt: jsonOptions.prompt
+                },
+                c.env
+              );
+            } 
+            // Use prompt-based extraction if only prompt is provided
+            else if (jsonOptions.prompt) {
+              extractionResult = await extractWithPrompt(
+                result.markdown,
+                {
+                  prompt: jsonOptions.prompt,
+                  outputFormat: 'json'
+                },
+                c.env
+              );
+            }
+            
+            if (extractionResult && extractionResult.success) {
+              result.json = extractionResult.data;
+            } else if (extractionResult) {
+              // Add warning but don't fail the request
+              result.warning = result.warning 
+                ? `${result.warning}; JSON extraction failed: ${extractionResult.error}`
+                : `JSON extraction failed: ${extractionResult.error}`;
+            }
+          } catch (error) {
+            // Log error but don't fail the entire request
+            console.error('JSON extraction error:', error);
+            result.warning = result.warning
+              ? `${result.warning}; JSON extraction error: ${(error as Error).message}`
+              : `JSON extraction error: ${(error as Error).message}`;
+          }
         }
 
         await closeBrowser(browser);

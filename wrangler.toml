@@ -11,6 +11,17 @@ enabled = true
 [browser]
 binding = "BROWSER"
 
+# LLM Configuration (OpenAI-compatible; defaults to OpenRouter)
+[vars]
+
+LLM_BASE_URL = "https://openrouter.ai/api/v1"
+LLM_MODEL = "x-ai/grok-4-fast"
+LLM_TIMEOUT = "30000"
+LLM_MAX_RETRIES = "3"
+
+# Note: OPENAI_API_KEY should be set as a secret:
+# npx wrangler secret put OPENAI_API_KEY
+
 # D1 database binding
 [[d1_databases]]
 binding = "DB"

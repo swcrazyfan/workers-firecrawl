@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS results (
   raw_html TEXT,
   links TEXT,
   metadata TEXT,
+  json TEXT,
   created_at INTEGER NOT NULL,
   FOREIGN KEY (job_id) REFERENCES jobs(id)
 );

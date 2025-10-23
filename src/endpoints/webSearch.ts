@@ -7,6 +7,7 @@ import {
   SearchResponseSchema,
   ErrorResponseSchema,
 } from "../types/schemas";
+import { extractStructuredData, extractWithPrompt } from "../utils/ai";
 
 export class WebSearch extends OpenAPIRoute {
   schema = {
@@ -78,6 +79,7 @@ export class WebSearch extends OpenAPIRoute {
           // Extract format types from scrapeOptions
           const formatTypes: string[] = [];
           let screenshotOptions: any = undefined;
+          let jsonFormat: any = undefined;
 
           if (scrapeOptions?.formats) {
             for (const format of scrapeOptions.formats) {
@@ -92,8 +94,9 @@ export class WebSearch extends OpenAPIRoute {
                     quality: formatObj.quality,
                   };
                 } else if (formatObj.type === 'json') {
-                  // JSON extraction would require LLM integration - not implemented yet
-                  formatTypes.push('markdown'); // Fallback to markdown
+                  // Store JSON format for later processing
+                  jsonFormat = formatObj;
+                  formatTypes.push('markdown'); // Need markdown for extraction
                 } else if (formatObj.type === 'changeTracking') {
                   // Change tracking would require caching - not implemented yet
                   formatTypes.push('markdown'); // Fallback to markdown
@@ -108,8 +111,8 @@ export class WebSearch extends OpenAPIRoute {
           }
 
           // Extract content from each result using shared utility
-          const promises = validUrls.map((url, index) =>
-            extractContent(browser, url, {
+          const promises = validUrls.map(async (url, index) => {
+            const content = await extractContent(browser, url, {
               formats: formatTypes,
               screenshot: screenshotOptions,
               headers: scrapeOptions?.headers,
@@ -121,11 +124,50 @@ export class WebSearch extends OpenAPIRoute {
               removeBase64Images: scrapeOptions?.removeBase64Images,
               blockAds: scrapeOptions?.blockAds,
               actions: scrapeOptions?.actions,
-            }).then(content => ({
+            });
+
+            // Perform JSON extraction if requested
+            if (jsonFormat && content.markdown) {
+              try {
+                let extractionResult;
+                
+                // Use schema-based extraction if schema is provided
+                if (jsonFormat.schema) {
+                  extractionResult = await extractStructuredData(
+                    content.markdown,
+                    {
+                      schema: jsonFormat.schema,
+                      prompt: jsonFormat.prompt
+                    },
+                    c.env
+                  );
+                } 
+                // Use prompt-based extraction if only prompt is provided
+                else if (jsonFormat.prompt) {
+                  extractionResult = await extractWithPrompt(
+                    content.markdown,
+                    {
+                      prompt: jsonFormat.prompt,
+                      outputFormat: 'json'
+                    },
+                    c.env
+                  );
+                }
+                
+                if (extractionResult && extractionResult.success) {
+                  content.json = extractionResult.data;
+                }
+              } catch (error) {
+                console.warn(`JSON extraction failed for ${url}:`, error);
+                // Continue without JSON data
+              }
+            }
+
+            return {
               ...content,
               position: index + 1
-            }))
-          );
+            };
+          });
 
           const webResults = await Promise.all(promises);
           
@@ -157,6 +199,7 @@ export class WebSearch extends OpenAPIRoute {
             // Extract format types from scrapeOptions
             const formatTypes: string[] = [];
             let screenshotOptions: any = undefined;
+            let jsonFormat: any = undefined;
 
             if (scrapeOptions?.formats) {
               for (const format of scrapeOptions.formats) {
@@ -171,8 +214,9 @@ export class WebSearch extends OpenAPIRoute {
                       quality: formatObj.quality,
                     };
                   } else if (formatObj.type === 'json') {
-                    // JSON extraction would require LLM integration - not implemented yet
-                    formatTypes.push('markdown'); // Fallback to markdown
+                    // Store JSON format for later processing
+                    jsonFormat = formatObj;
+                    formatTypes.push('markdown'); // Need markdown for extraction
                   } else if (formatObj.type === 'changeTracking') {
                     // Change tracking would require caching - not implemented yet
                     formatTypes.push('markdown'); // Fallback to markdown
@@ -202,6 +246,43 @@ export class WebSearch extends OpenAPIRoute {
                   blockAds: scrapeOptions?.blockAds,
                   actions: scrapeOptions?.actions,
                 });
+                
+                // Perform JSON extraction if requested
+                if (jsonFormat && content.markdown) {
+                  try {
+                    let extractionResult;
+                    
+                    // Use schema-based extraction if schema is provided
+                    if (jsonFormat.schema) {
+                      extractionResult = await extractStructuredData(
+                        content.markdown,
+                        {
+                          schema: jsonFormat.schema,
+                          prompt: jsonFormat.prompt
+                        },
+                        c.env
+                      );
+                    } 
+                    // Use prompt-based extraction if only prompt is provided
+                    else if (jsonFormat.prompt) {
+                      extractionResult = await extractWithPrompt(
+                        content.markdown,
+                        {
+                          prompt: jsonFormat.prompt,
+                          outputFormat: 'json'
+                        },
+                        c.env
+                      );
+                    }
+                    
+                    if (extractionResult && extractionResult.success) {
+                      content.json = extractionResult.data;
+                    }
+                  } catch (error) {
+                    console.warn(`JSON extraction failed for ${newsItem.url}:`, error);
+                    // Continue without JSON data
+                  }
+                }
                 
                 return {
                   title: newsItem.title,

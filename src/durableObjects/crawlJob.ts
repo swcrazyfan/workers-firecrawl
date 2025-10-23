@@ -4,6 +4,7 @@ import { RobotsParser } from "../utils/robotsParser";
 import { SitemapParser } from "../utils/sitemapParser";
 import type { CrawlRequest } from "../types/schemas";
 import type { Env } from "../index";
+import { extractStructuredData, extractWithPrompt } from "../utils/ai";
 
 interface StartRequest {
   jobId: string;
@@ -214,6 +215,7 @@ export class CrawlJob {
       // Extract format types from scrapeOptions
       const formatTypes: string[] = [];
       let screenshotOptions: any = undefined;
+      let jsonFormat: any = undefined;
 
       if (this.options.scrapeOptions?.formats) {
         for (const format of this.options.scrapeOptions.formats) {
@@ -228,7 +230,9 @@ export class CrawlJob {
                 quality: formatObj.quality,
               };
             } else if (formatObj.type === 'json') {
-              formatTypes.push('markdown'); // Fallback to markdown
+              // Store JSON format for later processing
+              jsonFormat = formatObj;
+              formatTypes.push('markdown'); // Need markdown for extraction
             } else if (formatObj.type === 'changeTracking') {
               formatTypes.push('markdown'); // Fallback to markdown
             }
@@ -262,10 +266,47 @@ export class CrawlJob {
         blockAds: this.options.scrapeOptions?.blockAds,
       });
       
+      // Perform JSON extraction if requested
+      if (jsonFormat && result.markdown) {
+        try {
+          let extractionResult;
+          
+          // Use schema-based extraction if schema is provided
+          if (jsonFormat.schema) {
+            extractionResult = await extractStructuredData(
+              result.markdown,
+              {
+                schema: jsonFormat.schema,
+                prompt: jsonFormat.prompt
+              },
+              this.env
+            );
+          } 
+          // Use prompt-based extraction if only prompt is provided
+          else if (jsonFormat.prompt) {
+            extractionResult = await extractWithPrompt(
+              result.markdown,
+              {
+                prompt: jsonFormat.prompt,
+                outputFormat: 'json'
+              },
+              this.env
+            );
+          }
+          
+          if (extractionResult && extractionResult.success) {
+            result.json = extractionResult.data;
+          }
+        } catch (error) {
+          console.warn(`JSON extraction failed for ${url}:`, error);
+          // Continue without JSON data
+        }
+      }
+      
       // Store result in D1
       await this.env.DB.prepare(`
-        INSERT INTO results (job_id, url, markdown, html, raw_html, links, metadata, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO results (job_id, url, markdown, html, raw_html, links, metadata, json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
         this.jobId,
         url,
@@ -274,11 +315,12 @@ export class CrawlJob {
         result.rawHtml || null,
         JSON.stringify(result.links || []),
         JSON.stringify(result.metadata || {}),
+        result.json ? JSON.stringify(result.json) : null,
         Date.now()
       ).run();
       
       console.log(`Successfully processed and stored result for URL: ${url}`);
-      console.log(`Result has rawHtml: ${!!result.rawHtml}, html: ${!!result.html}`);
+      console.log(`Result has rawHtml: ${!!result.rawHtml}, html: ${!!result.html}, json: ${!!result.json}`);
       
       // Discover new URLs
       const htmlContent = result.rawHtml || result.html || "";

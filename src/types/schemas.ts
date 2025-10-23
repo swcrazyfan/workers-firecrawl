@@ -218,6 +218,7 @@ export const ScrapeResponseSchema = z.object({
     rawHtml: z.string().optional(),
     screenshot: z.string().optional(),
     links: z.array(z.string()).optional(),
+    json: z.any().optional(),
     actions: ActionsResultSchema.optional(),
     metadata: MetadataSchema,
     warning: z.string().optional(),
