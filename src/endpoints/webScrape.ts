@@ -2,7 +2,7 @@ import { OpenAPIRoute, contentJson } from "chanfana";
 import type { AppContext } from "../index";
 import { getBrowser, closeBrowser } from "../utils/browser";
 import { extractContent } from "../utils/contentExtractor";
-import { extractStructuredData, extractWithPrompt } from "../utils/ai";
+import { extractStructuredData, extractWithPrompt, summarizeContentEnhanced } from "../utils/ai";
 import {
   ScrapeRequestSchema,
   ScrapeResponseSchema,
@@ -62,11 +62,20 @@ export class WebScrape extends OpenAPIRoute {
       const formatTypes: string[] = [];
       let screenshotOptions: any = undefined;
       let jsonOptions: { schema?: any; prompt?: string } | undefined;
+      let summaryOptions: any = undefined;
 
       if (formats) {
         for (const format of formats) {
           if (typeof format === 'string') {
             formatTypes.push(format);
+            // Set default summary options if format is "summary" string
+            if (format === 'summary') {
+              summaryOptions = summaryOptions || {
+                maxLength: 300,
+                type: 'concise',
+                tone: 'neutral'
+              };
+            }
           } else if (typeof format === 'object' && format.type) {
             if (format.type === 'screenshot') {
               formatTypes.push('screenshot');
@@ -81,6 +90,16 @@ export class WebScrape extends OpenAPIRoute {
                 schema: (format as any).schema,
                 prompt: (format as any).prompt
               };
+            } else if (format.type === 'summary') {
+              // Store summary options for later processing
+              formatTypes.push('summary');
+              summaryOptions = {
+                maxLength: (format as any).maxLength,
+                type: (format as any).summaryType,
+                tone: (format as any).tone,
+                focus: (format as any).focus,
+                language: (format as any).language
+              };
             } else if (format.type === 'changeTracking') {
               // Change tracking would require caching - not implemented yet
               formatTypes.push('markdown'); // Fallback to markdown
@@ -91,6 +110,16 @@ export class WebScrape extends OpenAPIRoute {
 
       // Default to markdown if no formats specified
       if (formatTypes.length === 0) {
+        formatTypes.push('markdown');
+      }
+      
+      // Ensure markdown is included if summary is requested (summary needs markdown content)
+      if (summaryOptions && !formatTypes.includes('markdown')) {
+        formatTypes.push('markdown');
+      }
+      
+      // Ensure markdown is included if JSON is requested (JSON extraction needs markdown content)
+      if (jsonOptions && !formatTypes.includes('markdown')) {
         formatTypes.push('markdown');
       }
 
@@ -170,6 +199,32 @@ export class WebScrape extends OpenAPIRoute {
             result.warning = result.warning
               ? `${result.warning}; JSON extraction error: ${(error as Error).message}`
               : `JSON extraction error: ${(error as Error).message}`;
+          }
+        }
+
+        // Process summary generation if requested
+        if (summaryOptions && result.markdown) {
+          try {
+            const summaryResult = await summarizeContentEnhanced(
+              c.env,
+              result.markdown,
+              summaryOptions
+            );
+            
+            if (summaryResult.success && summaryResult.data) {
+              result.summary = summaryResult.data.summary;
+            } else {
+              // Add warning but don't fail the request
+              result.warning = result.warning 
+                ? `${result.warning}; Summary generation failed: ${summaryResult.error}`
+                : `Summary generation failed: ${summaryResult.error}`;
+            }
+          } catch (error) {
+            // Log error but don't fail the entire request
+            console.error('Summary generation error:', error);
+            result.warning = result.warning
+              ? `${result.warning}; Summary generation error: ${(error as Error).message}`
+              : `Summary generation error: ${(error as Error).message}`;
           }
         }
 

@@ -377,34 +377,155 @@ if (scrapeOptions.formats?.includes('json') ||
 
 ---
 
-## Phase 4: Content Summarization 📋 PLANNED
+## Phase 4: Content Summarization ✅ COMPLETED
 
 ### Objectives
 Add AI-powered content summarization to all endpoints.
 
-### Implementation Plan
+### Implementation Details
 
-#### 4.1 Update Response Schemas
-- Add `summary` field to all response schemas
-- Support different summary types (concise, detailed, bullet points)
+#### 4.1 Enhanced Summarizer Created
+**File: `src/utils/ai/summarizer.ts`**
 
-#### 4.2 Implementation Strategy
-```typescript
-// Add summary option to formats
-if (formats.includes('summary')) {
-  const summary = await summarizeContent(c.env, result.markdown, {
-    maxLength: 300,
-    tone: 'neutral'
-  });
-  result.summary = summary;
+**Features implemented:**
+- Multiple summary types: concise, detailed, bullets, custom
+- Tone options: neutral, formal, casual, technical
+- Custom focus areas for targeted summarization
+- Multi-language support
+- Word count tracking
+- Key points extraction for bullet summaries
+- Comprehensive validation
+
+#### 4.2 Schema Updates
+**File: `src/types/schemas.ts`**
+
+**Changes made:**
+- Added `summary` literal format type
+- Added summary format object with options:
+  - `maxLength`: 10-1000 words (default: 300)
+  - `summaryType`: concise, detailed, bullets, custom
+  - `tone`: neutral, formal, casual, technical
+  - `focus`: custom focus area
+  - `language`: target language (default: English)
+- Summary field already present in response schemas
+
+#### 4.3 WebScrape Endpoint Updated
+**File: `src/endpoints/webScrape.ts`**
+
+**Changes implemented:**
+- Import enhanced summarizer
+- Parse summary format options
+- Process summary generation after content extraction
+- Graceful error handling with warnings
+- Support for combined formats (summary + JSON + markdown)
+
+#### 4.4 Summary Options
+- **Concise**: 1-2 sentences (default 300 words)
+- **Detailed**: Full paragraph summary (600 words)
+- **Bullet Points**: Key points extraction (5-7 bullets)
+- **Custom**: User-defined length and focus
+
+#### 4.5 Testing Resources
+**Test script created**: `test-summarization.sh`
+
+**Test coverage:**
+1. Basic concise summary
+2. Detailed summary with formal tone
+3. Bullet point summary
+4. Technical summary with custom focus
+5. Combined summary + JSON extraction
+6. Multi-language summary (Spanish)
+7. Error handling for short content
+
+**Run tests:**
+```bash
+# Set environment variables
+export WORKER_URL="http://localhost:8787"
+export API_KEY="your-api-key"
+
+# Run all tests
+./test-summarization.sh
+```
+
+#### 4.6 Example Requests
+
+**Basic summary:**
+```bash
+curl -X POST "http://localhost:8787/v2/scrape" \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "formats": ["markdown", "summary"]
+  }'
+```
+
+**Detailed summary with options:**
+```bash
+curl -X POST "http://localhost:8787/v2/scrape" \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "formats": [{
+      "type": "summary",
+      "maxLength": 500,
+      "summaryType": "detailed",
+      "tone": "formal",
+      "focus": "technical innovations"
+    }]
+  }'
+```
+
+**Bullet point summary:**
+```bash
+curl -X POST "http://localhost:8787/v2/scrape" \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "formats": [{
+      "type": "summary",
+      "summaryType": "bullets"
+    }]
+  }'
+```
+
+#### 4.7 Response Format
+```json
+{
+  "success": true,
+  "data": {
+    "markdown": "Full content...",
+    "summary": "This is a concise summary of the page content highlighting the main points and key information.",
+    "metadata": {
+      "title": "Page Title",
+      "sourceURL": "https://example.com",
+      "statusCode": 200
+    }
+  }
 }
 ```
 
-#### 4.3 Summary Options
-- **Concise**: 1-2 sentences (default)
-- **Detailed**: Full paragraph summary
-- **Bullet Points**: Key points extraction
-- **Custom**: User-defined length and focus
+**With warning on failure:**
+```json
+{
+  "success": true,
+  "data": {
+    "markdown": "...",
+    "metadata": {},
+    "warning": "Summary generation failed: Content too short for meaningful summarization"
+  }
+}
+```
+
+#### 4.8 Key Features
+- **Flexible summarization**: Multiple types and tones
+- **Language support**: Summarize in any language
+- **Custom focus**: Target specific aspects
+- **Graceful degradation**: Returns other formats even if summary fails
+- **Combined formats**: Works alongside JSON extraction and other formats
+- **Error handling**: Adds warnings instead of failing entire request
 
 ---
 

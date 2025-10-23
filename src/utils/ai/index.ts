@@ -20,6 +20,14 @@ export {
   createFallbackResponse,
 } from "./promptExtractor";
 
+// Re-export enhanced summarizer
+export {
+  summarizeContent as summarizeContentEnhanced,
+  validateSummaryOptions,
+  type SummaryOptions as EnhancedSummaryOptions,
+  type SummaryResult,
+} from "./summarizer";
+
 // Get a configured LLM instance (OpenAI-compatible; defaults to OpenRouter in config)
 export function getLLM(env: any) {
   const config = getLLMConfig(env);
