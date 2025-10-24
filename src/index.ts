@@ -7,6 +7,7 @@ import { WebCrawl } from "./endpoints/webCrawl";
 import { WebCrawlStatus } from "./endpoints/webCrawlStatus";
 import { WebExtract } from "./endpoints/webExtract";
 import { WebExtractStatus } from "./endpoints/webExtractStatus";
+import { WebMap } from "./endpoints/webMap";
 import { getBrowser, closeBrowser } from "./utils/browser";
 import { analyzeImageSearchPage, analyzeNewsSearchPage } from "./utils/contentExtractor";
 import { CrawlJob } from "./durableObjects/crawlJob";
@@ -42,6 +43,7 @@ openapi.post("/v2/crawl", WebCrawl);
 openapi.get("/v2/crawl/:id", WebCrawlStatus);
 openapi.post("/v2/extract", WebExtract);
 openapi.get("/v2/extract/:id", WebExtractStatus);
+openapi.post("/v2/map", WebMap);
 
 // V1 API endpoint (backward compatibility)
 openapi.post("/v1/search", WebSearch);

@@ -340,6 +340,28 @@ export const ExtractStatusResponseSchema = z.object({
   error: z.string().optional(),
 });
 
+// Map request schema (v2 API compatible)
+export const MapRequestSchema = z.object({
+  url: z.string().url(),
+  search: z.string().optional(),
+  sitemap: z.enum(["skip", "include", "only"]).default("include"),
+  includeSubdomains: z.boolean().default(true),
+  ignoreQueryParameters: z.boolean().default(true),
+  limit: z.number().min(1).max(100000).default(5000),
+  timeout: z.number().optional(),
+  location: LocationSchema.optional(),
+});
+
+// Map response schema (v2 API compatible)
+export const MapResponseSchema = z.object({
+  success: z.boolean(),
+  links: z.array(z.object({
+    url: z.string(),
+    title: z.string().optional(),
+    description: z.string().optional(),
+  })),
+});
+
 // Export types for TypeScript
 export type ScrapeRequest = z.infer<typeof ScrapeRequestSchema>;
 export type SearchRequest = z.infer<typeof SearchRequestSchema>;
@@ -351,6 +373,8 @@ export type CrawlStatusResponse = z.infer<typeof CrawlStatusResponseSchema>;
 export type ExtractRequest = z.infer<typeof ExtractRequestSchema>;
 export type ExtractResponse = z.infer<typeof ExtractResponseSchema>;
 export type ExtractStatusResponse = z.infer<typeof ExtractStatusResponseSchema>;
+export type MapRequest = z.infer<typeof MapRequestSchema>;
+export type MapResponse = z.infer<typeof MapResponseSchema>;
 export type Metadata = z.infer<typeof MetadataSchema>;
 export type BrowserAction = z.infer<typeof BrowserActionSchema>;
 export type ScreenshotOptions = z.infer<typeof ScreenshotOptionsSchema>;

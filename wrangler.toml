@@ -1,5 +1,5 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "workers-firecrawl"
+name = "fireflare"
 main = "src/index.ts"
 compatibility_date = "2025-01-28"
 compatibility_flags = [ "nodejs_compat" ]
@@ -25,7 +25,7 @@ LLM_MAX_RETRIES = "3"
 # D1 database binding
 [[d1_databases]]
 binding = "DB"
-database_name = "workers-firecrawl"
+database_name = "fireflare"
 database_id = "637dfc08-e6e8-490f-ba9c-8c452168709f" # Will be updated after creating the database
 
 # Durable Objects binding

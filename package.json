@@ -1,19 +1,19 @@
 {
-	"name": "workers-firecrawl",
+	"name": "fireflare",
 	"version": "0.0.1",
-	"description": "A Firecrawl compatible API implemented in Cloudflare Workers",
+	"description": "A Fireflare compatible API for web scraping and data extraction",
 	"scripts": {
 		"lint": "npx @biomejs/biome check src/ || (npx @biomejs/biome check --write src/; exit 1)"
 	},
 	"author": "Gabriel Massadas",
 	"license": "MIT",
-	"homepage": "https://github.com/G4brym/workers-firecrawl",
+	"homepage": "https://fireflare.dev",
 	"repository": {
 		"type": "git",
-		"url": "git@github.com:G4brym/workers-firecrawl.git"
+		"url": "git@github.com:fireflare/fireflare.git"
 	},
 	"bugs": {
-		"url": "https://github.com/G4brym/workers-firecrawl/issues"
+		"url": "https://github.com/fireflare/fireflare/issues"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "1.9.4",
