@@ -16,6 +16,7 @@ import { checkAIAvailability, getAIConfigStatus } from "./utils/ai";
 
 export type Env = {
 	BROWSER: Fetcher;
+	AI: Ai;
 	AUTHORIZATION_KEY?: string;
 	CRAWL_JOBS: DurableObjectNamespace;
 	DB: D1Database;

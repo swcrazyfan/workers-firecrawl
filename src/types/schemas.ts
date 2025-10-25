@@ -32,9 +32,18 @@ export const LocationSchema = z.object({
   languages: z.array(z.string()).default(["en-US"]).optional(),
 });
 
+// Agent configuration schema
+export const AgentSchema = z.object({
+  model: z.enum(['FLARE-1', 'FIRE-1']).default('FLARE-1').optional(),
+  prompt: z.string().optional(),
+  maxSteps: z.number().min(1).max(100).default(50).optional(),
+  maxSeconds: z.number().min(1).max(600).default(300).optional(),
+}).optional();
+
 // Main scrape request schema (v2 API compatible)
 export const ScrapeRequestSchema = z.object({
   url: z.string().url(),
+  agent: AgentSchema,
   formats: z.array(z.union([
     z.literal("markdown"),
     z.literal("html"),
@@ -313,11 +322,7 @@ export const ExtractRequestSchema = z.object({
   schema: z.any().optional(),
   enableWebSearch: z.boolean().default(false).optional(),
   scrapeOptions: CrawlScrapeOptionsSchema.optional(),
-  agent: z.object({
-    model: z.string().default("FIRE-1").optional(),
-    maxSteps: z.number().min(1).max(20).default(10).optional(),
-    timeout: z.number().default(300000).optional(),
-  }).optional(),
+  agent: AgentSchema,
 }).refine(
   (data) => data.prompt || data.schema,
   { message: "Either 'prompt' or 'schema' must be provided" }

@@ -5,6 +5,8 @@ import {
   ExtractResponseSchema,
   ErrorResponseSchema,
 } from "../types/schemas";
+import { Flare1Agent } from "../agents/flare1";
+import { ResultAggregator } from "../agents/resultAggregator";
 
 export class WebExtract extends OpenAPIRoute {
   schema = {
@@ -42,6 +44,8 @@ export class WebExtract extends OpenAPIRoute {
       const data = await this.getValidatedData<typeof this.schema>();
       const { urls, prompt, schema, enableWebSearch, scrapeOptions, agent } = data.body;
 
+      // FLARE-1 agent mode uses async Durable Object pattern (no timeout)
+      // Regular extraction also uses Durable Objects
       // Generate unique job ID
       const jobId = `extract_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 

@@ -1,0 +1,55 @@
+{
+  "name": "fireflare",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-17",
+  "compatibility_flags": ["nodejs_compat", "enable_nodejs_fs_module"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "alias": {
+    "playwright": "@cloudflare/playwright"
+  },
+  "vars": {
+    "LLM_BASE_URL": "https://openrouter.ai/api/v1",
+    "LLM_MODEL": "openai/gpt-4o-mini",
+    "LLM_TIMEOUT": "30000",
+    "LLM_MAX_RETRIES": "3"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fireflare",
+      "database_id": "637dfc08-e6e8-490f-ba9c-8c452168709f"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CRAWL_JOBS",
+        "class_name": "CrawlJob"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["CrawlJob"]
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "api.fireflare.dev",
+      "custom_domain": true
+    }
+  ],
+  "triggers": {
+    "crons": ["0 * * * *"]
+  }
+}

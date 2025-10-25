@@ -5,6 +5,7 @@ import { SitemapParser } from "../utils/sitemapParser";
 import type { CrawlRequest } from "../types/schemas";
 import type { Env } from "../index";
 import { extractStructuredData, extractWithPrompt } from "../utils/ai";
+import { Flare1Agent } from "../agents/flare1";
 
 interface StartRequest {
   jobId: string;
@@ -33,10 +34,14 @@ export class CrawlJob {
         return this.handleStart(request);
       case "/start-extract":
         return this.handleStartExtract(request);
+      case "/start-flare1":
+        return this.handleStartFlare1(request);
       case "/status":
         return this.handleStatus();
       case "/status-extract":
         return this.handleExtractStatus();
+      case "/status-flare1":
+        return this.handleFlare1Status();
       default:
         return new Response("Not Found", { status: 404 });
     }
@@ -155,8 +160,9 @@ export class CrawlJob {
     
     console.log(`Extract job ${jobId} initialized with ${urls.length} URLs`);
     
-    // Start extraction - pass jobId
-    this.state.waitUntil(this.startExtraction(jobId));
+    // Use alarm to start extraction (avoids waitUntil inactivity timeout)
+    await this.state.storage.put('extractionPending', true);
+    await this.state.storage.setAlarm(Date.now() + 100); // Start in 100ms
     
     return Response.json({ success: true });
   }
@@ -217,6 +223,11 @@ export class CrawlJob {
     // Load extract-specific options from DO storage
     const prompt = await this.state.storage.get('extractPrompt') as string;
     const schema = await this.state.storage.get('extractSchema');
+    const agent = await this.state.storage.get('extractAgent') as any;
+    
+    console.log(`[startExtraction ${jobId}] Agent from storage:`, JSON.stringify(agent));
+    console.log(`[startExtraction ${jobId}] Prompt:`, prompt);
+    console.log(`[startExtraction ${jobId}] Schema:`, schema ? 'present' : 'null');
     
     // Load job from D1
     const job = await this.env.DB.prepare(`
@@ -227,6 +238,15 @@ export class CrawlJob {
       console.error(`Extract job ${jobId} not found`);
       return;
     }
+    
+    // Check if FLARE-1 agent mode is requested
+    if (agent && (agent.model === 'FLARE-1' || agent.model === 'FIRE-1')) {
+      console.log(`[Extract Job ${jobId}] ✅ Using FLARE-1 agent mode`);
+      await this.processWithFlare1(jobId, job, agent, prompt, schema);
+      return;
+    }
+    
+    console.log(`[Extract Job ${jobId}] Using regular extraction (no agent or agent.model != FLARE-1)`);
     
     // Set instance variables
     this.jobId = jobId;
@@ -279,6 +299,82 @@ export class CrawlJob {
         
         console.error(`Failed to extract from ${urlRecord.url}:`, error);
       }
+    }
+  }
+
+  async processWithFlare1(jobId: string, job: any, agent: any, prompt: string, schema: any): Promise<void> {
+    try {
+      const urls = (job.url as string).split(',');
+      const flare1 = new Flare1Agent(this.env);
+      
+      console.log(`[FLARE-1 Extract ${jobId}] Processing ${urls.length} URLs`);
+      
+      for (const url of urls) {
+        try {
+          console.log(`[FLARE-1 Extract ${jobId}] Processing ${url}`);
+          
+          const result = await flare1.run({
+            url,
+            goal: agent.prompt || prompt || 'Extract structured data from this page',
+            schema,
+            maxSteps: agent.maxSteps || 50,
+            maxSeconds: agent.maxSeconds || 300,
+            verbose: true
+          });
+          
+          if (result.success) {
+            // Store result in D1
+            await this.env.DB.prepare(`
+              INSERT INTO results (job_id, url, json, metadata, created_at)
+              VALUES (?, ?, ?, ?, ?)
+            `).bind(
+              jobId,
+              url,
+              JSON.stringify(result.data),
+              JSON.stringify({
+                title: '',
+                description: '',
+                language: 'en',
+                sourceURL: url,
+                statusCode: 200,
+                error: null,
+                ...result.metadata
+              }),
+              Date.now()
+            ).run();
+            
+            // Update completed counter
+            await this.env.DB.prepare(`
+              UPDATE jobs SET completed = completed + 1 WHERE id = ?
+            `).bind(jobId).run();
+            
+            console.log(`[FLARE-1 Extract ${jobId}] Successfully processed ${url}`);
+          } else {
+            console.warn(`[FLARE-1 Extract ${jobId}] Failed to process ${url}:`, result.error);
+          }
+        } catch (error) {
+          console.error(`[FLARE-1 Extract ${jobId}] Error processing ${url}:`, error);
+        }
+      }
+      
+      // Mark job as completed
+      await this.completeExtraction(jobId);
+      
+    } catch (error) {
+      console.error(`[FLARE-1 Extract ${jobId}] Fatal error:`, error);
+      
+      // Mark job as failed
+      await this.env.DB.prepare(`
+        UPDATE jobs SET
+          status = 'failed',
+          error = ?,
+          completed_at = ?
+        WHERE id = ?
+      `).bind(
+        error instanceof Error ? error.message : 'Unknown error',
+        Date.now(),
+        jobId
+      ).run();
     }
   }
 
@@ -839,14 +935,201 @@ export class CrawlJob {
     );
   }
 
-  async alarm(): Promise<void> {
-    // Load jobId from storage (needed for cleanup)
+  async handleStartFlare1(request: Request): Promise<Response> {
+    const body = await request.json() as any;
+    const { jobId, url, agent, formats } = body;
+    
+    // Store jobId and config in DO storage
+    await this.state.storage.put('jobId', jobId);
+    await this.state.storage.put('flare1Config', { url, agent, formats });
+    
+    // Initialize job in D1
+    await this.env.DB.prepare(`
+      INSERT INTO jobs (id, url, status, options, total, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      jobId,
+      url,
+      'processing',
+      JSON.stringify({ agent, formats }),
+      1,
+      Date.now(),
+      Date.now() + (24 * 60 * 60 * 1000) // 24 hours
+    ).run();
+    
+    console.log(`FLARE-1 job ${jobId} initialized for URL: ${url}`);
+    
+    // Start FLARE-1 processing in background
+    this.state.waitUntil(this.startFlare1(jobId));
+    
+    return Response.json({ success: true });
+  }
+
+  async startFlare1(jobId: string): Promise<void> {
+    try {
+      // Load config from DO storage
+      const config = await this.state.storage.get('flare1Config') as any;
+      
+      if (!config) {
+        throw new Error('FLARE-1 config not found');
+      }
+      
+      console.log(`[FLARE-1 Job ${jobId}] Starting agent for ${config.url}`);
+      
+      // Run FLARE-1 agent
+      const flare1 = new Flare1Agent(this.env);
+      
+      // Extract schema from formats if present
+      let schema;
+      if (config.formats) {
+        for (const format of config.formats) {
+          if (typeof format === 'object' && format.type === 'json' && format.schema) {
+            schema = format.schema;
+            break;
+          }
+        }
+      }
+      
+      const result = await flare1.run({
+        url: config.url,
+        goal: config.agent.prompt || 'Extract all relevant content from this page',
+        schema,
+        maxSteps: config.agent.maxSteps || 50,
+        maxSeconds: config.agent.maxSeconds || 300,
+        verbose: true
+      });
+      
+      if (!result.success) {
+        throw new Error(result.error || 'FLARE-1 execution failed');
+      }
+      
+      console.log(`[FLARE-1 Job ${jobId}] Completed successfully`);
+      
+      // Store result in D1
+      await this.env.DB.prepare(`
+        INSERT INTO results (job_id, url, json, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(
+        jobId,
+        config.url,
+        JSON.stringify(result.data),
+        JSON.stringify({
+          title: '',
+          description: '',
+          language: 'en',
+          sourceURL: config.url,
+          statusCode: 200,
+          error: null,
+          ...result.metadata
+        }),
+        Date.now()
+      ).run();
+      
+      // Mark job as completed
+      await this.env.DB.prepare(`
+        UPDATE jobs SET
+          status = 'completed',
+          completed = 1,
+          completed_at = ?,
+          expires_at = ?
+        WHERE id = ?
+      `).bind(
+        Date.now(),
+        Date.now() + (24 * 60 * 60 * 1000),
+        jobId
+      ).run();
+      
+      // Set cleanup alarm
+      await this.state.storage.setAlarm(
+        Date.now() + (24 * 60 * 60 * 1000)
+      );
+      
+    } catch (error) {
+      console.error(`[FLARE-1 Job ${jobId}] Error:`, error);
+      
+      // Mark job as failed
+      await this.env.DB.prepare(`
+        UPDATE jobs SET
+          status = 'failed',
+          error = ?,
+          completed_at = ?
+        WHERE id = ?
+      `).bind(
+        error instanceof Error ? error.message : 'Unknown error',
+        Date.now(),
+        jobId
+      ).run();
+    }
+  }
+
+  async handleFlare1Status(): Promise<Response> {
+    // Get jobId from DO storage
     const jobId = await this.state.storage.get('jobId') as string;
     
     if (!jobId) {
-      console.error('No jobId found in storage for cleanup');
+      return Response.json(
+        { success: false, error: "Job ID not found" },
+        { status: 404 }
+      );
+    }
+    
+    const job = await this.env.DB.prepare(`
+      SELECT * FROM jobs WHERE id = ?
+    `).bind(jobId).first();
+    
+    if (!job) {
+      return Response.json(
+        { success: false, error: "Job not found" },
+        { status: 404 }
+      );
+    }
+    
+    // Get result if completed
+    let data = null;
+    if (job.status === 'completed') {
+      const result = await this.env.DB.prepare(`
+        SELECT * FROM results WHERE job_id = ? LIMIT 1
+      `).bind(jobId).first();
+      
+      if (result) {
+        data = {
+          json: result.json ? JSON.parse(result.json as string) : null,
+          metadata: result.metadata ? JSON.parse(result.metadata as string) : {}
+        };
+      }
+    }
+    
+    return Response.json({
+      success: true,
+      status: job.status,
+      data,
+      expiresAt: job.expires_at ? new Date(job.expires_at as number).toISOString() : undefined,
+      error: job.error as string | undefined
+    });
+  }
+
+  async alarm(): Promise<void> {
+    const jobId = await this.state.storage.get('jobId') as string;
+    
+    if (!jobId) {
+      console.error('No jobId found in storage for alarm');
       return;
     }
+    
+    // Check if this is for starting extraction
+    const extractionPending = await this.state.storage.get('extractionPending') as boolean;
+    
+    if (extractionPending) {
+      console.log(`[Alarm] Starting extraction for job ${jobId}`);
+      await this.state.storage.delete('extractionPending');
+      
+      // Start extraction (this runs in alarm context, no inactivity timeout)
+      await this.startExtraction(jobId);
+      return;
+    }
+    
+    // Otherwise, this is a cleanup alarm
+    console.log(`[Alarm] Cleaning up job ${jobId}`);
     
     // Delete all D1 data for this job
     await this.env.DB.prepare(`
@@ -861,7 +1144,7 @@ export class CrawlJob {
       DELETE FROM jobs WHERE id = ?
     `).bind(jobId).run();
     
-    // Clean up DO storage (remove jobId, baseUrl, options, etc.)
+    // Clean up DO storage
     await this.state.storage.deleteAll();
   }
 }

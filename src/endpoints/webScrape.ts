@@ -8,6 +8,7 @@ import {
   ScrapeResponseSchema,
   ErrorResponseSchema,
 } from "../types/schemas";
+import { Flare1Agent } from "../agents/flare1";
 
 export class WebScrape extends OpenAPIRoute {
   schema = {
@@ -46,6 +47,7 @@ export class WebScrape extends OpenAPIRoute {
       const {
         url,
         formats,
+        agent,
         onlyMainContent,
         includeTags,
         excludeTags,
@@ -57,6 +59,15 @@ export class WebScrape extends OpenAPIRoute {
         removeBase64Images,
         blockAds
       } = data.body;
+
+      // Note: FLARE-1 agent mode is not supported in /v2/scrape (synchronous endpoint)
+      // Use /v2/extract for agent mode, which supports async jobs
+      if (agent && (agent.model === 'FLARE-1' || agent.model === 'FIRE-1')) {
+        return Response.json({
+          success: false,
+          error: 'Agent mode is not supported in /v2/scrape. Please use /v2/extract endpoint for FLARE-1 agent mode, which supports async processing.'
+        }, { status: 400 });
+      }
 
       // Extract format types from the formats array
       const formatTypes: string[] = [];
