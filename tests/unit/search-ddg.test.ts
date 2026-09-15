@@ -105,6 +105,52 @@ describe("parseDdgHtml", () => {
 		).toThrow("ddg: anti-bot challenge");
 	});
 
+	it("skips redirect hrefs without a uddg param", () => {
+		const html = resultsPage(
+			resultBlock("//duckduckgo.com/l/?rut=xyz", "No Uddg", "gone"),
+			resultBlock("https://plain.example/ok", "Kept", "fine"),
+		);
+		expect(parseDdgHtml(html)).toEqual([
+			{ url: "https://plain.example/ok", title: "Kept", snippet: "fine" },
+		]);
+	});
+
+	it("matches result links and snippets carrying extra modifier classes", () => {
+		const html = `<div class="result results_links web-result">
+	<h2 class="result__title">
+		<a rel="nofollow" class="result__a result__highlight" href="https://a.com/mod">Modded</a>
+	</h2>
+	<a class="result__snippet result__snippet--lg" href="https://a.com/mod">kept snippet</a>
+</div>`;
+		expect(parseDdgHtml(html)).toEqual([
+			{ url: "https://a.com/mod", title: "Modded", snippet: "kept snippet" },
+		]);
+	});
+
+	it("does not throw when result text merely mentions the marker strings", () => {
+		const html = resultsPage(
+			resultBlock(
+				"https://a.com/talk",
+				"anomaly-modal discussion",
+				"how to handle challenge-form text",
+			),
+		);
+		expect(parseDdgHtml(html)).toEqual([
+			{
+				url: "https://a.com/talk",
+				title: "anomaly-modal discussion",
+				snippet: "how to handle challenge-form text",
+			},
+		]);
+	});
+
+	it("returns [] for inputs over 1MB without scanning", () => {
+		const oversized =
+			'<a rel="nofollow" class="result__a" href="https://a.com/big">Big</a>' +
+			"x".repeat(1_000_000);
+		expect(parseDdgHtml(oversized)).toEqual([]);
+	});
+
 	it("returns [] for empty or garbage pages", () => {
 		expect(parseDdgHtml("")).toEqual([]);
 		expect(parseDdgHtml("<html><body>nothing to see</body></html>")).toEqual([]);
@@ -185,8 +231,41 @@ describe("ddgWebSearch", () => {
 			expect(body.get("q")).toBe("firecrawl");
 			expect(body.get("s")).toBe("10");
 			expect(body.get("kl")).toBe("us-en");
+			expect(body.get("kp")).toBe("-2");
 			expect(body.get("df")).toBeNull();
 			expect(outcome.results.web).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("POSTs page 3 with s=25 as pagination continues", async () => {
+		vi.useFakeTimers();
+		try {
+			fetchMock
+				.mockImplementationOnce(() =>
+					Promise.resolve(
+						htmlResponse(resultsPage(resultBlock("https://a.com/1", "One", "s1"))),
+					),
+				)
+				.mockImplementationOnce(() =>
+					Promise.resolve(
+						htmlResponse(resultsPage(resultBlock("https://a.com/2", "Two", "s2"))),
+					),
+				);
+			const promise = ddgWebSearch({ ...baseInput, limit: 10 }, makeEnv());
+			await vi.advanceTimersByTimeAsync(2 * 1100 + 200);
+			const outcome = await promise;
+			// page 3 comes back empty (default mock) and stops the loop
+			expect(fetchMock).toHaveBeenCalledTimes(3);
+			const { url, init } = callAt(fetchMock, 2);
+			expect(url.toString()).toBe("https://html.duckduckgo.com/html/");
+			expect(init.method).toBe("POST");
+			const body = new URLSearchParams(String(init.body));
+			expect(body.get("s")).toBe("25");
+			expect(body.get("kl")).toBe("us-en");
+			expect(body.get("kp")).toBe("-2");
+			expect(outcome.results.web).toHaveLength(2);
 		} finally {
 			vi.useRealTimers();
 		}
@@ -312,6 +391,23 @@ describe("ddgWebSearch", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("omits the page-cap warning when the limit is reached before the cap", async () => {
+		fetchMock.mockImplementationOnce(() =>
+			Promise.resolve(
+				htmlResponse(
+					resultsPage(
+						resultBlock("https://a.com/1", "One", "s1"),
+						resultBlock("https://a.com/2", "Two", "s2"),
+					),
+				),
+			),
+		);
+		const outcome = await ddgWebSearch({ ...baseInput, limit: 2 }, makeEnv());
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(outcome.results.web).toHaveLength(2);
+		expect(outcome.warnings).toEqual([]);
 	});
 
 	it("returns the no-results warning for an empty results page", async () => {

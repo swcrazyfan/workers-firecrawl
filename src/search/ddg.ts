@@ -45,6 +45,7 @@ const ENTITY_DECODINGS: [RegExp, string][] = [
 	[/&gt;/g, ">"],
 	[/&quot;/g, '"'],
 	[/&#x27;/g, "'"],
+	[/&#39;/g, "'"],
 	[/&amp;/g, "&"],
 ];
 
@@ -84,14 +85,33 @@ function unwrapResultUrl(href: string): string | null {
 	}
 }
 
-const RESULT_LINK_RE = /<a\b[^>]*\bclass="result__a"[^>]*>([\s\S]*?)<\/a>/g;
+// Match the class attr as a word inside a possibly multi-valued class list
+// (DDG sometimes appends modifier classes); the {0,500} bound on the prefix
+// keeps the scan from going quadratic on malformed markup.
+const RESULT_LINK_RE =
+	/<a\b[^>]{0,500}class="[^"]*\bresult__a\b[^>]*>([\s\S]*?)<\/a>/g;
 const RESULT_SNIPPET_RE =
-	/<a\b[^>]*\bclass="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+	/<a\b[^>]{0,500}class="[^"]*\bresult__snippet\b[^>]*>([\s\S]*?)<\/a>/g;
+
+// Prefix match on the quoted attribute so result text merely *mentioning*
+// the marker strings can never trigger a false positive.
+const ANTI_BOT_MARKERS = [
+	'class="anomaly-modal',
+	'id="anomaly-modal"',
+	'class="challenge-form',
+	'id="challenge-form"',
+];
+
+const MAX_HTML_BYTES = 1_000_000;
 
 export function parseDdgHtml(
 	html: string,
 ): Array<{ url: string; title: string; snippet: string }> {
-	if (html.includes("anomaly-modal") || html.includes("challenge-form")) {
+	// CPU budget: real DDG results pages are a few tens of KB; anything
+	// past 1MB is pathological input that would burn the Workers CPU limit
+	// in the per-link scan, so bail out cheaply.
+	if (html.length > MAX_HTML_BYTES) return [];
+	if (ANTI_BOT_MARKERS.some((marker) => html.includes(marker))) {
 		throw new DdgAntiBotError();
 	}
 	const links = [...html.matchAll(RESULT_LINK_RE)];
@@ -220,6 +240,7 @@ export async function ddgWebSearch(
 				q: query,
 				s: String(10 + (page - 2) * 15),
 				kl,
+				kp,
 			});
 			if (mapped.df) form.set("df", mapped.df);
 			body = await fetchPageWithRetry(DDG_HTML_URL, {
