@@ -40,7 +40,7 @@ export async function extractContent(
 		// Attempt to close popups
 		await page.evaluate(() => {
 			const closeButtons = Array.from(
-				document.querySelectorAll("button, a"),
+				document.querySelectorAll<HTMLElement>("button, a"),
 			).filter(
 				(el) =>
 					el.textContent.toLowerCase().includes("close") ||
@@ -66,7 +66,7 @@ export async function extractContent(
 					? metaDescription.getAttribute("content")
 					: "No description available";
 
-				const body = document.body.cloneNode(true);
+				const body = document.body.cloneNode(true) as HTMLElement;
 				if (mainOnly) {
 					body
 						.querySelectorAll("script, style, nav, header, footer")

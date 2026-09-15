@@ -15,7 +15,7 @@ async function performSearch(browser: Browser, query: string, limit: number) {
 		}); // Wait for result title links
 		const urls = await page.evaluate(() => {
 			const links = Array.from(
-				document.querySelectorAll(
+				document.querySelectorAll<HTMLAnchorElement>(
 					'li[data-layout="organic"] [data-testid="result-title-a"]',
 				),
 			);
