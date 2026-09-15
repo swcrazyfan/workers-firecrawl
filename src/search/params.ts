@@ -40,7 +40,7 @@ const BARE_MAP: Record<
 function daysBetween(a: string, b: string): number {
 	const start = new Date(a).getTime();
 	const end = new Date(b).getTime();
-	return Math.abs(end - start) / (1000 * 60 * 60 * 24);
+	return (end - start) / (1000 * 60 * 60 * 24);
 }
 
 function timeRangeForSpan(days: number): TbsMapping["timeRange"] {
@@ -59,16 +59,25 @@ export function mapTbs(tbs: string | undefined): TbsMapping {
 		const minMatch = tbs.match(/cd_min:(\d{2})\/(\d{2})\/(\d{4})/);
 		const maxMatch = tbs.match(/cd_max:(\d{2})\/(\d{2})\/(\d{4})/);
 		if (minMatch && maxMatch) {
-			const df = `${minMatch[3]}-${minMatch[1]}-${minMatch[2]}..${maxMatch[3]}-${maxMatch[1]}-${maxMatch[2]}`;
-			const span = daysBetween(
-				`${minMatch[3]}-${minMatch[1]}-${minMatch[2]}`,
-				`${maxMatch[3]}-${maxMatch[1]}-${maxMatch[2]}`,
-			);
+			const minDate = `${minMatch[3]}-${minMatch[1]}-${minMatch[2]}`;
+			const maxDate = `${maxMatch[3]}-${maxMatch[1]}-${maxMatch[2]}`;
+			if (daysBetween(minDate, maxDate) < 0) {
+				warnings.push("invalid cdr range (min after max)");
+				return { warnings };
+			}
+			const df = `${minDate}..${maxDate}`;
+			const span = daysBetween(minDate, maxDate);
 			warnings.push("custom date range approximated for time_range");
 			return { df, timeRange: timeRangeForSpan(span), warnings };
 		}
 		warnings.push(`tbs "${tbs}" not recognized`);
 		return { warnings };
+	}
+
+	// Sort-by-date flag (can appear alongside other tokens)
+	const hasSbd = tbs.includes("sbd:1");
+	if (hasSbd) {
+		warnings.push("sbd:1 sort-by-date unsupported");
 	}
 
 	// Unsupported hour granularity
@@ -84,14 +93,13 @@ export function mapTbs(tbs: string | undefined): TbsMapping {
 		}
 	}
 
-	// Bare pass-through
-	if (BARE_MAP[tbs.toLowerCase()]) {
+	// Bare pass-through (only when no sbd flag)
+	if (!hasSbd && BARE_MAP[tbs.toLowerCase()]) {
 		return { ...BARE_MAP[tbs.toLowerCase()], warnings };
 	}
 
-	// Sort-by-date
-	if (tbs.includes("sbd:1")) {
-		warnings.push("sbd:1 sort-by-date unsupported");
+	// Drop sbd-only input
+	if (hasSbd) {
 		return { warnings };
 	}
 
@@ -160,7 +168,7 @@ const LOCATION_MAP: Record<string, string> = {
 	indonesia: "id-id",
 	philippines: "ph-tl",
 	vietnam: "vn-vi",
-	pakistan: "pk-ur",
+	pakistan: "pk-en",
 	bangladesh: "bd-bn",
 	"sri lanka": "lk-si",
 	nepal: "np-ne",
@@ -232,7 +240,7 @@ const LOCATION_MAP: Record<string, string> = {
 	sudan: "sd-ar",
 	ethiopia: "et-am",
 	ghana: "gh-en",
-	tanzania: "sw-sw",
+	tanzania: "tz-sw",
 	uganda: "ug-en",
 	zimbabwe: "zw-en",
 	zambia: "zm-en",
@@ -241,7 +249,7 @@ const LOCATION_MAP: Record<string, string> = {
 	mozambique: "mz-pt",
 	angola: "ao-pt",
 	cameroon: "cm-fr",
-	sengal: "sn-fr",
+	senegal: "sn-fr",
 	"ivory coast": "ci-fr",
 	"côte d'ivoire": "ci-fr",
 	mali: "ml-fr",
@@ -309,13 +317,13 @@ const LOCATION_MAP: Record<string, string> = {
 
 	// Russia & CIS
 	russia: "ru-ru",
-	ukraine: "uk-uk",
+	ukraine: "ua-uk",
 	belarus: "by-be",
 	moldova: "md-ro",
 	armenia: "am-hy",
 	azerbaijan: "az-az",
 	georgia: "ge-ka",
-	tajikistan: "tg-tg",
+	tajikistan: "tj-tg",
 	kyrgyzstan: "ky-ky",
 	turkmenistan: "tm-tm",
 };
@@ -370,7 +378,6 @@ const COUNTRY_LANG_MAP: Record<string, string> = {
 	"jp:ja": "jp-jp",
 	"cn:zh": "cn-zh",
 	"in:en": "in-en",
-	"in:hi": "in-hi",
 	"kr:ko": "kr-kr",
 	"hk:tzh": "hk-tzh",
 	"hk:en": "hk-en",
@@ -388,7 +395,6 @@ const COUNTRY_LANG_MAP: Record<string, string> = {
 	"ph:en": "ph-en",
 	"vn:vi": "vn-vi",
 	"vn:en": "vn-en",
-	"pk:ur": "pk-ur",
 	"pk:en": "pk-en",
 	"bd:bn": "bd-bn",
 	"bd:en": "bd-en",
@@ -513,7 +519,7 @@ const COUNTRY_LANG_MAP: Record<string, string> = {
 	"et:am": "et-am",
 	"et:en": "et-en",
 	"gh:en": "gh-en",
-	"tz:sw": "sw-sw",
+	"tz:sw": "tz-sw",
 	"tz:en": "tz-en",
 	"ug:en": "ug-en",
 	"zw:en": "zw-en",
@@ -623,7 +629,7 @@ const COUNTRY_LANG_MAP: Record<string, string> = {
 	// Russia & CIS
 	"ru:ru": "ru-ru",
 	"ru:en": "ru-en",
-	"ua:uk": "uk-uk",
+	"ua:uk": "ua-uk",
 	"ua:ru": "ua-ru",
 	"by:be": "by-be",
 	"by:ru": "by-ru",
@@ -635,8 +641,8 @@ const COUNTRY_LANG_MAP: Record<string, string> = {
 	"az:ru": "az-ru",
 	"ge:ka": "ge-ka",
 	"ge:ru": "ge-ru",
-	"tj:tg": "tg-tg",
-	"tj:ru": "tg-ru",
+	"tj:tg": "tj-tg",
+	"tj:ru": "tj-ru",
 	"kg:ky": "ky-ky",
 	"kg:ru": "ky-ru",
 	"tm:tm": "tm-tm",
@@ -695,7 +701,7 @@ const COUNTRY_MAP: Record<string, string> = {
 	ID: "id-id",
 	PH: "ph-tl",
 	VN: "vn-vi",
-	PK: "pk-ur",
+	PK: "pk-en",
 	BD: "bd-bn",
 	LK: "lk-si",
 	NP: "np-ne",
@@ -765,7 +771,7 @@ const COUNTRY_MAP: Record<string, string> = {
 	SD: "sd-ar",
 	ET: "et-am",
 	GH: "gh-en",
-	TZ: "sw-sw",
+	TZ: "tz-sw",
 	UG: "ug-en",
 	ZW: "zw-en",
 	ZM: "zm-en",
@@ -836,13 +842,13 @@ const COUNTRY_MAP: Record<string, string> = {
 
 	// Russia & CIS
 	RU: "ru-ru",
-	UA: "uk-uk",
+	UA: "ua-uk",
 	BY: "by-be",
 	MD: "md-ro",
 	AM: "am-hy",
 	AZ: "az-az",
 	GE: "ge-ka",
-	TJ: "tg-tg",
+	TJ: "tj-tg",
 	KG: "ky-ky",
 	TM: "tm-tm",
 };
@@ -861,7 +867,7 @@ const LANG_MAP: Record<string, string> = {
 	pt: "br-pt",
 	ko: "kr-kr",
 	ar: "sa-ar",
-	hi: "in-hi",
+	hi: "in-en",
 	th: "th-th",
 	vi: "vn-vi",
 	tr: "tr-tr",
@@ -892,7 +898,7 @@ const LANG_MAP: Record<string, string> = {
 	ms: "my-ms",
 	id: "id-id",
 	tl: "ph-tl",
-	ur: "pk-ur",
+	ur: "pk-en",
 	bn: "bd-bn",
 	si: "lk-si",
 	ta: "lk-ta",
@@ -908,7 +914,7 @@ const LANG_MAP: Record<string, string> = {
 	ku: "iq-ar",
 	hy: "am-hy",
 	ka: "ge-ka",
-	tg: "tg-tg",
+	tg: "tj-tg",
 	ky: "ky-ky",
 	tm: "tm-tm",
 
@@ -916,7 +922,7 @@ const LANG_MAP: Record<string, string> = {
 	af: "za-af",
 	zu: "za-zu",
 	xh: "za-xh",
-	sw: "sw-sw",
+	sw: "tz-sw",
 	am: "et-am",
 	ha: "ng-ha",
 	yo: "ng-yo",
@@ -932,7 +938,7 @@ const LANG_MAP: Record<string, string> = {
 	eu: "es-es",
 	gl: "es-es",
 	be: "by-be",
-	uk: "uk-uk",
+	uk: "ua-uk",
 	mk: "bg-bg",
 	sq: "al-al",
 	bs: "ba-ba",
@@ -979,6 +985,26 @@ const LANG_MAP: Record<string, string> = {
 
 const LOCATION_REGEX = /^[a-z ,.'-]+$/;
 
+function escapeRegExp(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Whole-word phrase matchers, longest name first so "guinea-bissau" wins over
+// "guinea". Boundaries are non-letter edges, so a bare substring can never
+// match: legacy's `loc.includes("us")` bug ("russia" contains "us") is
+// impossible here because "us" is not a map key and words are matched whole.
+const LOCATION_PHRASE_MATCHERS: [RegExp, string][] = Object.entries(
+	LOCATION_MAP,
+)
+	.sort((a, b) => b[0].length - a[0].length)
+	.map(
+		([name, kl]) =>
+			[new RegExp(`(^|[^a-z])${escapeRegExp(name)}([^a-z]|$)`), kl] as [
+				RegExp,
+				string,
+			],
+	);
+
 function normalize(input?: string): string | undefined {
 	if (!input) return undefined;
 	const trimmed = input.trim().toLowerCase();
@@ -994,10 +1020,15 @@ export function klFrom(input: {
 	const lang = normalize(input.lang);
 	const location = normalize(input.location);
 
-	// 1. Exact location name
+	// 1. Exact location name, then whole-word phrase inside a longer location
 	if (location && location.length >= 3 && LOCATION_REGEX.test(location)) {
 		if (LOCATION_MAP[location]) {
 			return LOCATION_MAP[location];
+		}
+		for (const [matcher, kl] of LOCATION_PHRASE_MATCHERS) {
+			if (matcher.test(location)) {
+				return kl;
+			}
 		}
 	}
 

@@ -49,6 +49,13 @@ describe("search/params", () => {
 			).toBe("year");
 		});
 
+		it("rejects reversed cdr range (min after max) without df/timeRange", () => {
+			const result = mapTbs("cdr:1,cd_min:09/15/2026,cd_max:09/01/2026");
+			expect(result.df).toBeUndefined();
+			expect(result.timeRange).toBeUndefined();
+			expect(result.warnings).toEqual(["invalid cdr range (min after max)"]);
+		});
+
 		it("passes through bare tokens", () => {
 			expect(mapTbs("d")).toEqual({ df: "d", timeRange: "day", warnings: [] });
 			expect(mapTbs("w")).toEqual({ df: "w", timeRange: "week", warnings: [] });
@@ -62,6 +69,22 @@ describe("search/params", () => {
 
 		it("drops sbd:1 with warning", () => {
 			expect(mapTbs("sbd:1")).toEqual({
+				warnings: ["sbd:1 sort-by-date unsupported"],
+			});
+		});
+
+		it("keeps qdr mapping when combined with sbd:1 (qdr first)", () => {
+			expect(mapTbs("qdr:w,sbd:1")).toEqual({
+				df: "w",
+				timeRange: "week",
+				warnings: ["sbd:1 sort-by-date unsupported"],
+			});
+		});
+
+		it("keeps qdr mapping when combined with sbd:1 (sbd first)", () => {
+			expect(mapTbs("sbd:1,qdr:w")).toEqual({
+				df: "w",
+				timeRange: "week",
 				warnings: ["sbd:1 sort-by-date unsupported"],
 			});
 		});
@@ -119,6 +142,18 @@ describe("search/params", () => {
 
 		it("does not substring-match locations", () => {
 			expect(klFrom({ location: "Russia" })).toBe("ru-ru");
+			// Legacy bug detector: "russia" contains the substring "us".
+			// Word-boundary matching must resolve via "russia", never "us".
+			const kl = klFrom({ location: "Russia springs" });
+			expect(kl).not.toBe("us-en");
+			expect(kl).toBe("ru-ru");
+		});
+
+		it("matches whole-word locations inside longer strings", () => {
+			expect(klFrom({ location: "Moscow, Russia" })).toBe("ru-ru");
+			expect(klFrom({ location: "london uk" })).toBe("uk-en");
+			expect(klFrom({ location: "ukraine conflict" })).toBe("ua-uk");
+			expect(klFrom({ location: "west indies cricket" })).toBe("us-en"); // no word match
 		});
 
 		it("rejects short location strings", () => {
@@ -128,7 +163,57 @@ describe("search/params", () => {
 
 		it("rejects invalid characters in location", () => {
 			expect(klFrom({ location: "us123" })).toBe("us-en");
-			expect(klFrom({ location: "united states!" })).toBe("us-en"); // falls back
+			// "germany!" must be regex-rejected to the default, while clean
+			// "germany" maps to de-de — asserting both keeps the paths distinct.
+			expect(klFrom({ location: "germany!" })).toBe("us-en");
+			expect(klFrom({ location: "germany" })).toBe("de-de");
+		});
+
+		it("fixes Senegal key typo (regression: was 'sengal')", () => {
+			expect(klFrom({ location: "Senegal" })).toBe("sn-fr");
+			expect(klFrom({ country: "SN" })).toBe("sn-fr");
+		});
+
+		it("fixes Tanzania to tz region codes, not the sw language code", () => {
+			expect(klFrom({ location: "Tanzania" })).toBe("tz-sw");
+			expect(klFrom({ country: "TZ" })).toBe("tz-sw");
+			expect(klFrom({ country: "tz", lang: "sw" })).toBe("tz-sw");
+			expect(klFrom({ country: "tz", lang: "en" })).toBe("tz-en");
+			expect(klFrom({ lang: "sw" })).toBe("tz-sw");
+		});
+
+		it("fixes Ukraine to ua-uk, not the UK region bucket", () => {
+			expect(klFrom({ location: "Ukraine" })).toBe("ua-uk");
+			expect(klFrom({ country: "UA" })).toBe("ua-uk");
+			expect(klFrom({ country: "ua", lang: "uk" })).toBe("ua-uk");
+			expect(klFrom({ lang: "uk" })).toBe("ua-uk");
+		});
+
+		it("keeps DDG-documented hk-tzh and tw-tzh codes", () => {
+			// duckduckgo.com/params lists "hk-tzh for Hong Kong" and
+			// "tw-tzh for Taiwan" — tzh is DDG's suffix, not a typo.
+			expect(klFrom({ location: "Hong Kong" })).toBe("hk-tzh");
+			expect(klFrom({ location: "Taiwan" })).toBe("tw-tzh");
+			expect(klFrom({ country: "HK", lang: "tzh" })).toBe("hk-tzh");
+			expect(klFrom({ country: "TW", lang: "tzh" })).toBe("tw-tzh");
+			expect(klFrom({ country: "HK" })).toBe("hk-tzh");
+			expect(klFrom({ country: "TW" })).toBe("tw-tzh");
+		});
+
+		it("drops unsupported in-hi and pk-ur, falling back to country defaults", () => {
+			// DDG has no in-hi/pk-ur region; country-only fallback is correct.
+			expect(klFrom({ country: "in", lang: "hi" })).toBe("in-en");
+			expect(klFrom({ country: "pk", lang: "ur" })).toBe("pk-en");
+			expect(klFrom({ location: "Pakistan" })).toBe("pk-en");
+			expect(klFrom({ country: "PK" })).toBe("pk-en");
+			expect(klFrom({ lang: "hi" })).toBe("in-en");
+			expect(klFrom({ lang: "ur" })).toBe("pk-en");
+		});
+
+		it("fixes Tajikistan to tj region codes, not the tg language code", () => {
+			expect(klFrom({ location: "Tajikistan" })).toBe("tj-tg");
+			expect(klFrom({ country: "TJ" })).toBe("tj-tg");
+			expect(klFrom({ country: "tj", lang: "ru" })).toBe("tj-ru");
 		});
 
 		it("falls back to country-only when lang is unknown", () => {
