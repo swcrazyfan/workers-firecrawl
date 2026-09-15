@@ -27,6 +27,14 @@ const MAX_PAGES = 3;
 const delay = (ms: number) =>
 	new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+// Re-number positions as contiguous 1..N on the final items array —
+// called after invalid drops, dedupe, and limit slicing. Constraint keeps
+// position optional because zod-inferred result types are all-optional
+// under this project's strictNullChecks: false setting.
+function renumberPositions<T extends { position?: number }>(items: T[]): T[] {
+	return items.map((item, index) => ({ ...item, position: index + 1 }));
+}
+
 interface SearxngEngineError {
 	error?: string;
 }
@@ -56,17 +64,21 @@ function searchEndpoint(env: Env): string {
 	return `${cleaned}/search`;
 }
 
-function authHeaders(env: Env): Record<string, string> {
-	if (!env.SEARXNG_HEADERS) return {};
+function authHeaders(env: Env, warnings: string[]): Record<string, string> {
+	// Base headers always apply; parsed SEARXNG_HEADERS merge over the base
+	// and win on key collision (allows deliberate overrides).
+	const base: Record<string, string> = { "content-type": "application/json" };
+	if (!env.SEARXNG_HEADERS) return base;
 	try {
 		const parsed = JSON.parse(env.SEARXNG_HEADERS);
 		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			return parsed as Record<string, string>;
+			return { ...base, ...(parsed as Record<string, string>) };
 		}
 	} catch {
-		// ignore malformed JSON — fall through to no extra headers
+		// fall through to the warning below
 	}
-	return {};
+	warnings.push("searxng: SEARXNG_HEADERS is not valid JSON — ignoring");
+	return base;
 }
 
 function buildPageParams(
@@ -180,25 +192,15 @@ function describeEngineErrors(
 	return parts.join("; ");
 }
 
-function normalizeItems(
-	source: "web",
-	items: SearxngRawItem[],
-	positions: number[],
-): WebResult[];
-function normalizeItems(
-	source: "news",
-	items: SearxngRawItem[],
-	positions: number[],
-): NewsResult[];
+function normalizeItems(source: "web", items: SearxngRawItem[]): WebResult[];
+function normalizeItems(source: "news", items: SearxngRawItem[]): NewsResult[];
 function normalizeItems(
 	source: "images",
 	items: SearxngRawItem[],
-	positions: number[],
 ): ImageResult[];
 function normalizeItems(
 	source: SearchSource,
 	items: SearxngRawItem[],
-	positions: number[],
 ): unknown[] {
 	if (source === "web") {
 		const web: WebResult[] = [];
@@ -208,7 +210,7 @@ function normalizeItems(
 				url: item.url,
 				title: item.title ?? "",
 				description: item.content ?? "",
-				position: positions[index],
+				position: index + 1, // provisional — renumbered after dedupe + slice
 			});
 			if (parsed.success) web.push(parsed.data);
 		});
@@ -224,7 +226,7 @@ function normalizeItems(
 				snippet: item.content ?? "",
 				date: item.publishedDate ?? undefined,
 				imageUrl: item.thumbnail_src ?? item.img_src ?? undefined,
-				position: positions[index],
+				position: index + 1, // provisional — renumbered after dedupe + slice
 			});
 			if (parsed.success) news.push(parsed.data);
 		});
@@ -238,7 +240,7 @@ function normalizeItems(
 			url: item.url && item.url !== item.img_src ? item.url : undefined,
 			title: item.title,
 			...parseResolution(item.resolution),
-			position: positions[index],
+			position: index + 1, // provisional — renumbered after dedupe + slice
 		});
 		if (parsed.success) images.push(parsed.data);
 	});
@@ -268,10 +270,13 @@ async function searchSource(
 	sharedWarnings: string[],
 ): Promise<{ results: SearchResults; warning?: string }> {
 	const baseUrl = searchEndpoint(env);
-	const headers = authHeaders(env);
+	const headers = authHeaders(env, sharedWarnings);
 	const collected: SearxngRawItem[] = [];
-	// Set when page-1 fails (or is empty with unresponsive engines); surfaced
-	// as a warning if the source ends up contributing no results at all.
+	// Set whenever a page fetch fails or page-1 is empty with unresponsive
+	// engines. ALWAYS surfaced as a warning — when zero results were
+	// collected it is the source's only warning; when some results were
+	// collected the partial results are still returned and the failure is
+	// reported alongside them (mid-pagination failures never vanish).
 	let failureWarning: string | undefined;
 
 	for (let page = 1; page <= MAX_PAGES; page += 1) {
@@ -319,45 +324,40 @@ async function searchSource(
 		if (collected.length >= input.limit) break;
 	}
 
-	const positions = collected.map((_, index) => index + 1);
-
 	if (source === "web") {
-		const normalized = normalizeItems("web", collected, positions);
-		const items = dedupeByUrl(normalized, (item) => item.url).slice(
-			0,
-			input.limit,
+		const items = renumberPositions(
+			dedupeByUrl(normalizeItems("web", collected), (item) => item.url).slice(
+				0,
+				input.limit,
+			),
 		);
-		if (items.length === 0) {
-			return failureWarning
-				? { results: {}, warning: failureWarning }
-				: { results: {} };
-		}
-		return { results: { web: items } };
+		return {
+			results: items.length > 0 ? { web: items } : {},
+			warning: failureWarning,
+		};
 	}
 	if (source === "news") {
-		const normalized = normalizeItems("news", collected, positions);
-		const items = dedupeByUrl(normalized, (item) => item.url).slice(
-			0,
-			input.limit,
+		const items = renumberPositions(
+			dedupeByUrl(normalizeItems("news", collected), (item) => item.url).slice(
+				0,
+				input.limit,
+			),
 		);
-		if (items.length === 0) {
-			return failureWarning
-				? { results: {}, warning: failureWarning }
-				: { results: {} };
-		}
-		return { results: { news: items } };
+		return {
+			results: items.length > 0 ? { news: items } : {},
+			warning: failureWarning,
+		};
 	}
-	const normalized = normalizeItems("images", collected, positions);
-	const items = dedupeByUrl(normalized, (item) => item.imageUrl).slice(
-		0,
-		input.limit,
+	const items = renumberPositions(
+		dedupeByUrl(
+			normalizeItems("images", collected),
+			(item) => item.imageUrl,
+		).slice(0, input.limit),
 	);
-	if (items.length === 0) {
-		return failureWarning
-			? { results: {}, warning: failureWarning }
-			: { results: {} };
-	}
-	return { results: { images: items } };
+	return {
+		results: items.length > 0 ? { images: items } : {},
+		warning: failureWarning,
+	};
 }
 
 export async function searxngSearch(
@@ -383,9 +383,15 @@ export async function searxngSearch(
 			return;
 		}
 		const { results: sourceResults, warning } = outcome.value;
+		const contributed =
+			(sourceResults.web?.length ?? 0) > 0 ||
+			(sourceResults.news?.length ?? 0) > 0 ||
+			(sourceResults.images?.length ?? 0) > 0;
 		if (warning) {
-			failures += 1;
+			// Partial results + warning is not a failed source; only sources
+			// that warned AND contributed nothing count toward total failure.
 			warnings.push(warning);
+			if (!contributed) failures += 1;
 		}
 		if (sourceResults.web?.length) results.web = sourceResults.web;
 		if (sourceResults.news?.length) results.news = sourceResults.news;

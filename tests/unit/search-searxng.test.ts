@@ -131,7 +131,7 @@ describe("searxngSearch", () => {
 				imageHeight: 1080,
 				position: 1,
 			},
-			{ title: "Same", imageUrl: "https://img.com/same.jpg", position: 3 },
+			{ title: "Same", imageUrl: "https://img.com/same.jpg", position: 2 },
 		]);
 	});
 
@@ -325,8 +325,42 @@ describe("searxngSearch", () => {
 			),
 		);
 		const outcome = await searxngSearch(baseInput, makeEnv());
-		expect(outcome.results.web).toEqual([{ url: "https://ok.com/", title: "Ok", description: "", position: 2 }]);
+		expect(outcome.results.web).toEqual([{ url: "https://ok.com/", title: "Ok", description: "", position: 1 }]);
 		expect(outcome.warnings).toEqual([]);
+	});
+
+	it("surfaces a mid-pagination failure warning alongside partial results", async () => {
+		fetchMock.mockImplementation((rawUrl: string) => {
+			const url = new URL(rawUrl);
+			if (url.searchParams.get("pageno") === "1") {
+				return Promise.resolve(
+					pageOf([
+						{ url: "https://a.com/1", title: "One" },
+						{ url: "https://a.com/2", title: "Two" },
+					]),
+				);
+			}
+			return Promise.resolve(new Response("forbidden", { status: 403 }));
+		});
+		const outcome = await searxngSearch(baseInput, makeEnv());
+		expect(outcome.results.web).toEqual([
+			{ url: "https://a.com/1", title: "One", description: "", position: 1 },
+			{ url: "https://a.com/2", title: "Two", description: "", position: 2 },
+		]);
+		expect(outcome.warnings.some((w) => w.includes("403"))).toBe(true);
+	});
+
+	it("warns on malformed SEARXNG_HEADERS but still sends the base content-type header", async () => {
+		fetchMock.mockResolvedValueOnce(emptyPage());
+		const outcome = await searxngSearch(
+			baseInput,
+			makeEnv({ SEARXNG_HEADERS: "{not json" }),
+		);
+		expect(
+			outcome.warnings.some((w) => w.includes("SEARXNG_HEADERS is not valid JSON")),
+		).toBe(true);
+		const init = (fetchMock.mock.calls as unknown as [string, RequestInit][])[0][1];
+		expect(new Headers(init?.headers).get("content-type")).toBe("application/json");
 	});
 
 	it("merges SEARXNG_HEADERS (CF Access service token) into request headers", async () => {
