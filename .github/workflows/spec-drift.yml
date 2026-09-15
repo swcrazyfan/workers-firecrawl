@@ -1,0 +1,63 @@
+name: Firecrawl v2 spec drift
+
+# NOTE: scheduled runs only fire from the default branch; until this workflow
+# merges to `main` it runs on demand via workflow_dispatch.
+on:
+  schedule:
+    - cron: "17 8 * * 1" # Mondays 08:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and normalize live spec
+        run: |
+          curl -fsSL --max-time 90 https://docs.firecrawl.dev/api-reference/v2-openapi.json -o live.json
+          jq -S . live.json > live.normalized.json
+
+      - name: Diff against vendored spec
+        id: diff
+        run: |
+          if diff spec/v2-openapi.json live.normalized.json > drift.diff; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "lines=$(wc -l < drift.diff)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update drift issue
+        if: steps.diff.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXCERPT="$(head -n 40 drift.diff)"
+          BODY="$(cat <<EOF
+          The vendored Firecrawl v2 OpenAPI spec (\`spec/v2-openapi.json\`) differs from the live spec
+          (<https://docs.firecrawl.dev/api-reference/v2-openapi.json>) by ${{ steps.diff.outputs.lines }} diff lines.
+
+          Diff excerpt (first 40 lines):
+
+          \`\`\`diff
+          $EXCERPT
+          \`\`\`
+
+          Review the changes against our v2 implementation, then refresh the vendored spec with
+          \`scripts/check-spec-drift.sh --update\` and commit the result.
+          EOF
+          )"
+          TITLE="Firecrawl v2 spec drift detected"
+          EXISTING="$(gh issue list --state open --search "in:title $TITLE" --json number --jq '.[0].number')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "updated existing issue #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+            echo "opened new drift issue"
+          fi
