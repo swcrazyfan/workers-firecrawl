@@ -59,10 +59,10 @@ docs/specs/              # per-task implementation specs (agents read these)
 | # | Task | Files (scope) | Deps | Wave |
 |---|---|---|---|---|
 | 001 | ✅ Vendor v2 spec + drift CI (PR #1) | `spec/`, `scripts/`, `.github/workflows/spec-drift.yml` | — | 1 |
-| 004a | Fix base tsc errors + CI typecheck | `src/browser.ts`, `src/webSearch.ts`, `ci.yml` | — | 2 |
+| 004a | ✅ Fix base tsc errors + CI typecheck (PR #4) | `src/browser.ts`, `src/webSearch.ts`, `ci.yml` | — | 2 |
 | 002 | ✅ Search params (kl tables, tbs mappers) (PR #2) | `src/search/params.ts` + test | — | 1 |
 | 003 | ✅ SearXNG provider (PR #3) | `src/search/types.ts`, `src/search/searxng.ts`, `Env` + tests | 002 (contract) | 1 |
-| 004 | DDG fetch provider | `src/search/ddg.ts` + fixtures/tests | 002 | 2 |
+| 004 | ✅ DDG fetch provider (PR #5) | `src/search/ddg.ts` + fixtures/tests | 002 | 2 |
 | 005 | Provider chain + DDG browser fallback | `src/search/provider.ts`, `src/search/ddgBrowser.ts` | 003, 004 | 2 |
 | 006 | `/v2/search` route | `src/v2/search.ts`, `src/index.ts` | 005 | 2 |
 | 007 | `/v2/map` route | `src/v2/map.ts`, `src/crawler/sitemap.ts` | — | 3 |
