@@ -8,6 +8,11 @@ import { WebSearch } from "./webSearch";
 export type Env = {
 	BROWSER: Fetcher;
 	AUTHORIZATION_KEY?: string;
+	SEARCH_PROVIDER?: string; // "searxng" | "ddg" | "browser"
+	SEARCH_FALLBACK?: string; // "ddg" | "browser" | "none"
+	SEARXNG_ENDPOINT?: string;
+	SEARXNG_ENGINES?: string;
+	SEARXNG_HEADERS?: string; // JSON object of extra headers (CF Access etc.)
 };
 export type AppContext = Context<{ Bindings: Env }>;
 
