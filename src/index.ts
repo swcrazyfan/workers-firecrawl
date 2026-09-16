@@ -14,7 +14,7 @@ export type Env = {
 	BROWSER: Fetcher;
 	AUTHORIZATION_KEY?: string;
 	DB: D1Database; // crawl storage (D1)
-	CRAWL_WORKFLOW?: Workflow<{ jobId: string }>; // crawl engine, optional until task 012 lands
+	CRAWL_WORKFLOW: Workflow<{ jobId: string }>; // crawl engine (task 012)
 	SEARCH_CHAIN?: string; // comma-separated provider ids tried in order: "ddg" | "ddg-media" | "searxng" | "browser"
 	SEARXNG_ENDPOINT?: string;
 	SEARXNG_ENGINES?: string;
@@ -49,6 +49,10 @@ openapi.post("/v2/scrape", V2Scrape);
 openapi.post("/v2/crawl", V2Crawl);
 openapi.get("/v2/crawl/:id", V2CrawlStatus);
 openapi.delete("/v2/crawl/:id", V2CrawlStatus);
+
+// Exported for the `CRAWL_WORKFLOW` binding; Cloudflare Workflows instantiate
+// this class by name.
+export { CrawlWorkflow } from "./crawler/workflow";
 
 // Export the Hono app
 export default app;

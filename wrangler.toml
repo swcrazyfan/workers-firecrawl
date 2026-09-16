@@ -15,3 +15,8 @@ binding = "BROWSER"
 binding = "DB"
 database_name = "workers-firecrawl"
 database_id = "637dfc08-e6e8-490f-ba9c-8c452168709f"
+
+[[workflows]]
+name = "workers-firecrawl-crawl"
+binding = "CRAWL_WORKFLOW"
+class_name = "CrawlWorkflow"
