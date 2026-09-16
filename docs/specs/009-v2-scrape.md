@@ -85,3 +85,23 @@ Mock `../../src/browser` (no puppeteer). Cases:
 ## Do NOT
 - touch `/v1/scrape` or `src/scrape.ts` behaviour, implement AI extraction (task 010),
   implement `actions`, or add dependencies
+
+## Amendments (post-review, authoritative)
+
+1. **`warning` goes INSIDE `data`** for scrape (`data.warning`, nullable) per
+   `spec/v2-openapi.json` — NOT top-level. (Top-level `warning` is correct for
+   `/v2/search`; the two contracts differ.)
+2. **Unimplemented formats are accept-and-warn, not 400** (SDK compatibility):
+   `images`, `rawBase64`, `changeTracking`, `branding`, `product`, `menu`, `audio`, `video`,
+   `question`, `highlights` → do not fetch them; add warning
+   `"format <type> is not supported by this deployment"`.
+   Also accept object forms of the SUPPORTED formats (`{type:"markdown"}` etc.) as equivalent
+   to their string form.
+3. **`{type:"screenshot",quality:N}` and `viewport`**: accepted, applied on a best-effort basis,
+   and when the pipeline cannot honour them emit
+   `"screenshot quality/viewport options are ignored"`.
+4. **`timeout`**: `z.number().int().min(1000).max(300000).default(60000)` — pass it to the
+   extraction pipeline (do not leave it unused).
+5. **`url`**: `z.string().url()` (contract `format: uri`).
+6. Wrap browser acquisition so a launch failure returns the 500 envelope
+   `{success:false,error}` instead of an unhandled Hono error.
