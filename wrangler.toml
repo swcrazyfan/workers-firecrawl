@@ -1,4 +1,7 @@
 #:schema node_modules/wrangler/config-schema.json
+# PENDING DECISION: the owner has not decided whether to replace the existing
+# "workers-firecrawl" worker with this build or deploy it under a new name.
+# `name` is intentionally left unchanged until that call is made.
 name = "workers-firecrawl"
 main = "src/index.ts"
 compatibility_date = "2025-01-28"
@@ -10,6 +13,46 @@ enabled = true
 
 [browser]
 binding = "BROWSER"
+
+# Workers AI: fallback AI provider for extraction. Used when LLM_PROVIDER is
+# "workers-ai", or when no LLM key is configured and this binding exists.
+[ai]
+binding = "AI"
+
+[vars]
+# Ordered, comma-separated search providers. Valid ids: ddg | ddg-media |
+# searxng | browser. Each provider is tried in order and the first one to
+# return results for a requested source wins it. `searxng` is dropped at parse
+# time unless SEARXNG_ENDPOINT is configured. See README "Search".
+SEARCH_CHAIN = "ddg,ddg-media,browser"
+# Strict-JSON behaviour for schema-backed extraction:
+#   "auto" (default) tries strict json_schema and falls back to non-strict when
+#          the provider rejects it;
+#   "on"   requires strict and surfaces failures;
+#   "off"  never sends a strict schema. See README "AI extraction".
+LLM_STRICT_JSON = "auto"
+LLM_TIMEOUT_MS = "20000"
+LLM_MAX_REPAIRS = "2"
+LLM_MAX_INPUT_CHARS = "48000"
+# OpenAI-compatible provider defaults (OpenRouter). z.ai alternative:
+#   LLM_PROVIDER = "openai"
+#   LLM_BASE_URL = "https://api.z.ai/api/paas/v4"
+#   LLM_MODEL = "glm-5.3-flash"
+# When no LLM_API_KEY/OPENAI_API_KEY is set, extraction uses the [ai] Workers AI
+# binding instead (or reports AI as unconfigured if the binding is absent).
+LLM_PROVIDER = "openai"
+LLM_BASE_URL = "https://openrouter.ai/api/v1"
+LLM_MODEL = "z-ai/glm-5.3-flash"
+
+# SECRETS — never put values in this file. Set each with
+#   npx wrangler secret put <NAME>
+# LLM_API_KEY (or OPENAI_API_KEY) — LLM provider key. When unset, extraction
+#   falls back to Workers AI, or returns a warning that AI is unconfigured.
+# AUTHORIZATION_KEY — optional bearer token. When unset the API is OPEN (no auth).
+# SEARXNG_ENDPOINT — optional SearXNG base URL; required to enable the searxng
+#   provider in SEARCH_CHAIN.
+# SEARXNG_HEADERS — optional JSON object of extra request headers (e.g. CF Access).
+# SEARXNG_ENGINES — optional comma-separated SearXNG engine list.
 
 [[d1_databases]]
 binding = "DB"
