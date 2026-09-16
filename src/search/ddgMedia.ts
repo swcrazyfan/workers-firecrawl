@@ -19,6 +19,8 @@ const INTERPAGE_DELAY_MS = 400;
 const MAX_PAGES = 3;
 const NEWS_PAGE_SIZE = 30;
 const IMAGES_PAGE_SIZE = 100;
+// Same guard as ddg.ts: pathological vqd pages are bailed out before regexing.
+const MAX_HTML_BYTES = 1_000_000;
 
 const USER_AGENTS = [
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -37,10 +39,31 @@ export class DdgVqdError extends Error {
 }
 
 // Per-source failure already carrying its final warning text; caught by the
-// source wrappers so one dead endpoint never takes down the other.
+// pagination loop so a dead page keeps the partials and never takes down the
+// other source.
 class DdgSourceError extends Error {}
 
 type SourceKind = "news" | "images";
+
+// `p` is the per-endpoint SAFESEARCH code — never the page number; page
+// offsets ride on `s` alone. Codes per the ddgs reference implementation.
+const SAFESEARCH_CODES: Record<
+	SourceKind,
+	{ on: string; moderate: string; off: string }
+> = {
+	news: { on: "1", moderate: "-1", off: "-2" },
+	images: { on: "1", moderate: "1", off: "-1" },
+};
+
+function safesearchParam(
+	source: SourceKind,
+	safe: boolean | undefined,
+): string {
+	const codes = SAFESEARCH_CODES[source];
+	if (safe === true) return codes.on;
+	if (safe === false) return codes.off;
+	return codes.moderate;
+}
 
 // ---------------------------------------------------------------------------
 // Fetching
@@ -106,8 +129,13 @@ async function fetchSourceJson(
 
 const VQD_QUOTED_RE = /vqd="([^"]+)"/;
 const VQD_FALLBACK_RE = /vqd=([0-9-]+)&/;
+const VQD_SINGLE_QUOTED_RE = /vqd='([^']+)'/;
 
-export async function extractVqd(query: string, kl: string): Promise<string> {
+export async function extractVqd(
+	query: string,
+	kl: string,
+	lang?: string,
+): Promise<string> {
 	const params = new URLSearchParams({ q: query, kl });
 	let body: string;
 	try {
@@ -115,7 +143,7 @@ export async function extractVqd(query: string, kl: string): Promise<string> {
 			`${DDG_SEARCH_URL}?${params.toString()}`,
 			{
 				method: "GET",
-				headers: requestHeaders(undefined, "text/html,application/xhtml+xml"),
+				headers: requestHeaders(lang, "text/html,application/xhtml+xml"),
 			},
 		);
 		if (!response.ok) throw new DdgVqdError(`HTTP ${response.status}`);
@@ -124,8 +152,11 @@ export async function extractVqd(query: string, kl: string): Promise<string> {
 		if (error instanceof DdgVqdError) throw error;
 		throw new DdgVqdError("network error");
 	}
+	if (body.length > MAX_HTML_BYTES) throw new DdgVqdError("page too large");
 	const token =
-		VQD_QUOTED_RE.exec(body)?.[1] ?? VQD_FALLBACK_RE.exec(body)?.[1];
+		VQD_QUOTED_RE.exec(body)?.[1] ??
+		VQD_FALLBACK_RE.exec(body)?.[1] ??
+		VQD_SINGLE_QUOTED_RE.exec(body)?.[1];
 	if (token === undefined) throw new DdgVqdError("token not found");
 	return token;
 }
@@ -230,15 +261,25 @@ async function paginate<T>(
 	limit: number,
 	mapItem: (raw: object, position: number) => T | null,
 	dedupeKey: (item: T) => string | null,
-): Promise<T[]> {
+): Promise<{ items: T[]; warning?: string }> {
 	const collected: T[] = [];
 	const seen = new Set<string>();
 	for (let page = 1; page <= MAX_PAGES; page += 1) {
 		if (page > 1) await delay(INTERPAGE_DELAY_MS);
-		const body = await fetchSourceJson(source, urlForPage(page), {
-			method: "GET",
-			headers,
-		});
+		let body: unknown;
+		try {
+			body = await fetchSourceJson(source, urlForPage(page), {
+				method: "GET",
+				headers,
+			});
+		} catch (error) {
+			// Fail soft and KEEP the partials already collected — a dead page 2
+			// must never discard usable page-1 results.
+			if (error instanceof DdgSourceError) {
+				return { items: collected, warning: error.message };
+			}
+			throw error;
+		}
 		let added = 0;
 		for (const raw of extractResults(body)) {
 			if (typeof raw !== "object" || raw === null) continue;
@@ -256,7 +297,7 @@ async function paginate<T>(
 		if (added === 0) break;
 		if (collected.length >= limit) break;
 	}
-	return collected;
+	return { items: collected };
 }
 
 // Positions are provisional until after the slice — renumbered 1..N, like
@@ -294,10 +335,14 @@ async function collectNews(
 	kl: string,
 	vqd: string,
 	df: string | undefined,
+	safe: boolean | undefined,
 	lang: string | undefined,
 	limit: number,
-): Promise<NewsResult[]> {
-	const headers = requestHeaders(lang, "application/json");
+): Promise<{ items: NewsResult[]; warning?: string }> {
+	const headers = {
+		...requestHeaders(lang, "application/json"),
+		Referer: DDG_SEARCH_URL,
+	};
 	const urlForPage = (page: number) => {
 		const params = new URLSearchParams({
 			l: kl,
@@ -305,13 +350,13 @@ async function collectNews(
 			noamp: "1",
 			q: query,
 			vqd,
-			p: String(page),
+			p: safesearchParam("news", safe),
 			...(df !== undefined ? { df } : {}),
 			s: String((page - 1) * NEWS_PAGE_SIZE),
 		});
 		return `${DDG_NEWS_URL}?${params.toString()}`;
 	};
-	const raw = await paginate(
+	const { items, warning } = await paginate(
 		"news",
 		urlForPage,
 		headers,
@@ -319,7 +364,7 @@ async function collectNews(
 		mapNewsItem,
 		(item) => normalizeUrlKey(item.url),
 	);
-	return finalizeResults(raw, limit, parseNewsItem);
+	return { items: finalizeResults(items, limit, parseNewsItem), warning };
 }
 
 async function collectImages(
@@ -327,24 +372,28 @@ async function collectImages(
 	kl: string,
 	vqd: string,
 	timeFilter: string | undefined,
+	safe: boolean | undefined,
 	lang: string | undefined,
 	limit: number,
-): Promise<ImageResult[]> {
-	const headers = requestHeaders(lang, "application/json");
+): Promise<{ items: ImageResult[]; warning?: string }> {
+	const headers = {
+		...requestHeaders(lang, "application/json"),
+		Referer: DDG_SEARCH_URL,
+	};
 	const urlForPage = (page: number) => {
 		const params = new URLSearchParams({
 			o: "json",
 			q: query,
 			l: kl,
 			vqd,
-			p: String(page),
+			p: safesearchParam("images", safe),
 			...(timeFilter !== undefined ? { f: timeFilter } : {}),
 			s: String((page - 1) * IMAGES_PAGE_SIZE),
 			ct: "AT",
 		});
 		return `${DDG_IMAGES_URL}?${params.toString()}`;
 	};
-	const raw = await paginate(
+	const { items, warning } = await paginate(
 		"images",
 		urlForPage,
 		headers,
@@ -352,7 +401,7 @@ async function collectImages(
 		mapImageItem,
 		(item) => normalizeUrlKey(item.imageUrl),
 	);
-	return finalizeResults(raw, limit, parseImageItem);
+	return { items: finalizeResults(items, limit, parseImageItem), warning };
 }
 
 // ---------------------------------------------------------------------------
@@ -364,29 +413,17 @@ type SourceOutcome =
 	| { kind: "images"; items: ImageResult[]; warning?: string };
 
 async function runNews(
-	task: () => Promise<NewsResult[]>,
+	task: () => Promise<{ items: NewsResult[]; warning?: string }>,
 ): Promise<SourceOutcome> {
-	try {
-		return { kind: "news", items: await task() };
-	} catch (error) {
-		if (error instanceof DdgSourceError) {
-			return { kind: "news", items: [], warning: error.message };
-		}
-		throw error;
-	}
+	const { items, warning } = await task();
+	return { kind: "news", items, warning };
 }
 
 async function runImages(
-	task: () => Promise<ImageResult[]>,
+	task: () => Promise<{ items: ImageResult[]; warning?: string }>,
 ): Promise<SourceOutcome> {
-	try {
-		return { kind: "images", items: await task() };
-	} catch (error) {
-		if (error instanceof DdgSourceError) {
-			return { kind: "images", items: [], warning: error.message };
-		}
-		throw error;
-	}
+	const { items, warning } = await task();
+	return { kind: "images", items, warning };
 }
 
 export async function ddgMediaSearch(
@@ -414,7 +451,7 @@ export async function ddgMediaSearch(
 	// source but never throws — the provider chain decides the messaging.
 	let vqd: string;
 	try {
-		vqd = await extractVqd(query, kl);
+		vqd = await extractVqd(query, kl, input.lang);
 	} catch (error) {
 		if (!(error instanceof DdgVqdError)) throw error;
 		if (wantsNews) warnings.push(`ddg-media: ${error.reason}`);
@@ -426,7 +463,15 @@ export async function ddgMediaSearch(
 	if (wantsNews) {
 		jobs.push(
 			runNews(() =>
-				collectNews(query, kl, vqd, mapped.df, input.lang, input.limit),
+				collectNews(
+					query,
+					kl,
+					vqd,
+					mapped.df,
+					input.safe,
+					input.lang,
+					input.limit,
+				),
 			),
 		);
 	}
@@ -438,6 +483,7 @@ export async function ddgMediaSearch(
 					kl,
 					vqd,
 					imagesTimeFilter(mapped.timeRange),
+					input.safe,
 					input.lang,
 					input.limit,
 				),

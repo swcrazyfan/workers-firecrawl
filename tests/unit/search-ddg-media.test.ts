@@ -42,6 +42,13 @@ function vqdFallbackPage(token = "987-654"): Response {
 	);
 }
 
+// Only a single-quoted `vqd='...'` — neither double-quoted nor unquoted form.
+function vqdSingleQuotedPage(token = "abc-789"): Response {
+	return htmlResponse(
+		`<html><body><script>window.vqd='${token}';</script></body></html>`,
+	);
+}
+
 function newsItem(overrides: Record<string, unknown> = {}): Record<
 	string,
 	unknown
@@ -135,6 +142,33 @@ describe("extractVqd", () => {
 		const fetchMock = vi.fn(() => Promise.resolve(vqdFallbackPage("987-654")));
 		vi.stubGlobal("fetch", fetchMock);
 		await expect(extractVqd("q", "us-en")).resolves.toBe("987-654");
+	});
+
+	it("falls back to the single-quoted vqd form as a third option", async () => {
+		const fetchMock = vi.fn(() => Promise.resolve(vqdSingleQuotedPage("abc-789")));
+		vi.stubGlobal("fetch", fetchMock);
+		await expect(extractVqd("q", "us-en")).resolves.toBe("abc-789");
+	});
+
+	it("honors lang for the vqd page Accept-Language", async () => {
+		const fetchMock = vi.fn(() => Promise.resolve(vqdPage("tok")));
+		vi.stubGlobal("fetch", fetchMock);
+		await extractVqd("q", "de-de", "de");
+		const headers = new Headers(callsOf(fetchMock)[0].init.headers);
+		expect(headers.get("Accept-Language")).toBe("de");
+	});
+
+	it("throws DdgVqdError for a page over the 1MB body cap", async () => {
+		const fetchMock = vi.fn(() =>
+			Promise.resolve(htmlResponse(`vqd="x"${"a".repeat(1_000_000)}`)),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const error = await extractVqd("q", "us-en").then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(error).toBeInstanceOf(DdgVqdError);
+		expect((error as Error).message).toBe("ddg-vqd: page too large");
 	});
 
 	it("throws DdgVqdError when the page carries no token", async () => {
@@ -333,17 +367,20 @@ describe("ddgMediaSearch", () => {
 			expect(first.get("o")).toBe("json");
 			expect(first.get("vqd")).toBe("tok-1");
 			expect(first.get("s")).toBe("0");
-			expect(first.get("p")).toBe("1");
+			// p is the safesearch code (moderate when safe is unset), not the page
+			expect(first.get("p")).toBe("-1");
 			expect(first.get("l")).toBe("de-de");
 			expect(first.get("q")).toBe("firecrawl");
 			expect(first.get("noamp")).toBe("1");
 			expect(first.get("df")).toBe("w");
 			const second = newsCalls[1].url.searchParams;
 			expect(second.get("s")).toBe("30");
-			expect(second.get("p")).toBe("2");
+			// page 2 advances only via s — p stays the same safesearch code
+			expect(second.get("p")).toBe("-1");
 			const headers = new Headers(newsCalls[0].init.headers);
 			expect(headers.get("Accept")).toBe("application/json");
 			expect(headers.get("Accept-Language")).toBe("de");
+			expect(headers.get("Referer")).toBe("https://duckduckgo.com/");
 			expect(headers.get("User-Agent")).toBeTruthy();
 			expect(outcome.results.news).toHaveLength(2);
 		} finally {
@@ -378,13 +415,17 @@ describe("ddgMediaSearch", () => {
 			expect(first.get("o")).toBe("json");
 			expect(first.get("vqd")).toBe("tok-2");
 			expect(first.get("s")).toBe("0");
+			// images moderate safesearch is 1, same as "on"
 			expect(first.get("p")).toBe("1");
 			expect(first.get("l")).toBe("us-en");
 			expect(first.get("f")).toBe("time:Week");
 			expect(first.get("ct")).toBe("AT");
 			const second = imageCalls[1].url.searchParams;
 			expect(second.get("s")).toBe("100");
-			expect(second.get("p")).toBe("2");
+			// page 2 advances only via s — p stays the same safesearch code
+			expect(second.get("p")).toBe("1");
+			const headers = new Headers(imageCalls[0].init.headers);
+			expect(headers.get("Referer")).toBe("https://duckduckgo.com/");
 		} finally {
 			vi.useRealTimers();
 		}
@@ -405,6 +446,88 @@ describe("ddgMediaSearch", () => {
 		expect(outcome.results.images).toBeUndefined();
 		expect(outcome.warnings).toEqual(["ddg-media images: 403 blocked"]);
 		expect(callsTo(fetchMock, "/i.js")).toHaveLength(1);
+	});
+
+	it("warns but keeps images when news.js answers 403", async () => {
+		const fetchMock = routeFetch({
+			"/": [vqdPage()],
+			"/news.js": [new Response("forbidden", { status: 403 })],
+			"/i.js": [jsonResponse({ results: [imageItem()] })],
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const outcome = await ddgMediaSearch(
+			{ ...baseInput, limit: 1 },
+			makeEnv(),
+		);
+		expect(outcome.results.news).toBeUndefined();
+		expect(outcome.results.images).toHaveLength(1);
+		expect(outcome.warnings).toEqual(["ddg-media news: 403 blocked"]);
+		expect(callsTo(fetchMock, "/news.js")).toHaveLength(1);
+	});
+
+	it("keeps page-1 items when page 2 is 403 blocked", async () => {
+		const fetchMock = routeFetch({
+			"/": [vqdPage()],
+			"/news.js": [
+				jsonResponse({
+					results: [
+						newsItem({ url: "https://keep.com/1" }),
+						newsItem({ url: "https://keep.com/2" }),
+					],
+				}),
+				new Response("forbidden", { status: 403 }),
+			],
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		vi.useFakeTimers();
+		try {
+			const promise = ddgMediaSearch(
+				{ ...baseInput, limit: 5, sources: ["news"] },
+				makeEnv(),
+			);
+			await vi.advanceTimersByTimeAsync(500);
+			const outcome = await promise;
+			expect(callsTo(fetchMock, "/news.js")).toHaveLength(2);
+			expect(outcome.results.news?.map((r) => r.url)).toEqual([
+				"https://keep.com/1",
+				"https://keep.com/2",
+			]);
+			expect(outcome.results.news?.map((r) => r.position)).toEqual([1, 2]);
+			expect(outcome.warnings).toEqual(["ddg-media news: 403 blocked"]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("maps input.safe to per-endpoint safesearch p (news 1/-1/-2, images 1/1/-1)", async () => {
+		const fetchMock = routeFetch({
+			"/": [1, 2, 3, 4, 5, 6].map(() => vqdPage("tok-p")),
+			"/news.js": [1, 2, 3].map((n) =>
+				jsonResponse({ results: [newsItem({ url: `https://p.com/${n}` })] }),
+			),
+			"/i.js": [1, 2, 3].map((n) =>
+				jsonResponse({
+					results: [imageItem({ image: `https://p.com/${n}.jpg` })],
+				}),
+			),
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		for (const safe of [true, undefined, false] as const) {
+			await ddgMediaSearch(
+				{ ...baseInput, limit: 1, sources: ["news"], safe },
+				makeEnv(),
+			);
+			await ddgMediaSearch(
+				{ ...baseInput, limit: 1, sources: ["images"], safe },
+				makeEnv(),
+			);
+		}
+		expect(
+			callsTo(fetchMock, "/news.js").map((c) => c.url.searchParams.get("p")),
+		).toEqual(["1", "-1", "-2"]);
+		expect(
+			callsTo(fetchMock, "/i.js").map((c) => c.url.searchParams.get("p")),
+		).toEqual(["1", "1", "-1"]);
 	});
 
 	it("warns on both sources and never throws when vqd extraction fails", async () => {
