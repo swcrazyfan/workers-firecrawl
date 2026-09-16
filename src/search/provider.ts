@@ -41,12 +41,32 @@ const PROVIDER_MESSAGE_PREFIXES: Record<string, string[]> = {
 	browser: ["browser", "ddg-browser"],
 };
 
-function prefixReason(id: string, message: string): string {
-	const prefixes = PROVIDER_MESSAGE_PREFIXES[id] ?? [id];
-	if (prefixes.some((prefix) => message.startsWith(`${prefix}:`))) {
+// Own-property lookups everywhere: `in`/bare indexing would walk
+// Object.prototype, so `SEARCH_CHAIN=constructor` would look like a known
+// provider and blow up on `capabilities.includes`.
+function knownProvider(id: string): boolean {
+	return (
+		Object.hasOwn(PROVIDER_CAPABILITIES, id) && Object.hasOwn(PROVIDERS, id)
+	);
+}
+
+function aliasesFor(id: string): string[] {
+	return Object.hasOwn(PROVIDER_MESSAGE_PREFIXES, id)
+		? PROVIDER_MESSAGE_PREFIXES[id]
+		: [id];
+}
+
+function prefixWarning(id: string, message: string): string {
+	if (aliasesFor(id).some((prefix) => message.startsWith(`${prefix}:`))) {
 		return message;
 	}
 	return `${id}: ${message}`;
+}
+
+// A provider's generic "nothing found" line — usable as a last-resort reason
+// but never preferred over a real diagnostic (vqd failure, 403, ...).
+function isGenericNoResults(id: string, warning: string): boolean {
+	return aliasesFor(id).some((prefix) => warning === `${prefix}: no results`);
 }
 
 function messageOf(error: unknown): string {
@@ -73,27 +93,35 @@ export function parseSearchChain(
 	searxngEndpoint?: string,
 ): { chain: string[]; warnings: string[] } {
 	const warnings: string[] = [];
+	const ids = (raw ?? "")
+		.split(",")
+		.map((token) => token.trim().toLowerCase())
+		.filter((id) => id.length > 0);
+
+	// Unset or blank config → the documented default chain. A configured-but-
+	// unusable chain does NOT silently fall back to the default: swapping in
+	// providers the operator never asked for hides the misconfiguration.
+	if (ids.length === 0) {
+		return { chain: [...DEFAULT_SEARCH_CHAIN], warnings };
+	}
+
 	const chain: string[] = [];
-	for (const token of (raw ?? "").split(",")) {
-		const id = token.trim().toLowerCase();
-		if (id.length === 0) continue;
-		if (!(id in PROVIDER_CAPABILITIES)) {
+	const seen = new Set<string>();
+	for (const id of ids) {
+		if (!Object.hasOwn(PROVIDER_CAPABILITIES, id)) {
 			warnings.push(`unknown search provider "${id}" skipped`);
 			continue;
 		}
+		if (seen.has(id)) continue; // dedupe, first occurrence wins
+		seen.add(id);
 		chain.push(id);
 	}
-	if (chain.length === 0) chain.push(...DEFAULT_SEARCH_CHAIN);
 
 	// searxng is dormant unless an endpoint is configured — drop it up front
 	// instead of letting it fail at call time.
 	if (chain.includes("searxng") && !searxngEndpoint) {
 		warnings.push("searxng skipped: SEARXNG_ENDPOINT not configured");
-		const usable = chain.filter((id) => id !== "searxng");
-		return {
-			chain: usable.length > 0 ? usable : [...DEFAULT_SEARCH_CHAIN],
-			warnings,
-		};
+		return { chain: chain.filter((id) => id !== "searxng"), warnings };
 	}
 
 	return { chain, warnings };
@@ -108,6 +136,17 @@ export async function searchWithFallback(
 	}
 
 	const parsed = parseSearchChain(env.SEARCH_CHAIN, env.SEARXNG_ENDPOINT);
+	// Nothing left after parsing means the configuration itself is broken —
+	// say so rather than reporting a provider failure.
+	if (parsed.chain.length === 0) {
+		throw new SearchUnavailableError(
+			[
+				"no usable providers configured (SEARCH_CHAIN resolved empty)",
+				...parsed.warnings,
+			].join("; "),
+		);
+	}
+
 	const warnings = [...parsed.warnings];
 	const results: SearchResults = {};
 	const missing = new Set<Source>(input.sources);
@@ -119,6 +158,7 @@ export async function searchWithFallback(
 	// for a source wins it.
 	for (const id of parsed.chain) {
 		if (missing.size === 0) break;
+		if (!knownProvider(id)) continue;
 		const capabilities = PROVIDER_CAPABILITIES[id];
 		const runner = PROVIDERS[id];
 		if (capabilities === undefined || runner === undefined) continue;
@@ -131,7 +171,10 @@ export async function searchWithFallback(
 		let filled = false;
 		try {
 			const outcome = await runner({ ...input, sources: servable }, env);
-			warnings.push(...outcome.warnings);
+			const providerWarnings = outcome.warnings.map((warning) =>
+				prefixWarning(id, warning),
+			);
+			warnings.push(...providerWarnings);
 			for (const source of servable) {
 				const items = outcome.results[source];
 				if (items === undefined || items.length === 0) continue;
@@ -139,17 +182,31 @@ export async function searchWithFallback(
 				missing.delete(source);
 				filled = true;
 			}
+			// A provider must not widen the result set beyond what it was
+			// asked for, even if it returns extra keys.
+			for (const key of Object.keys(outcome.results)) {
+				const items = outcome.results[key as Source];
+				if (
+					servable.includes(key as Source) ||
+					!Array.isArray(items) ||
+					items.length === 0
+				) {
+					continue;
+				}
+				warnings.push(`${id}: ignoring unrequested source "${key}"`);
+			}
 			if (!filled) {
-				// Prefer the provider's own no-results wording (e.g.
-				// "ddg-browser: no results") over a second label.
+				// Carry the provider's real diagnostic (vqd failure, 403, ...)
+				// instead of the generic "no results" when it has one.
+				const meaningful = providerWarnings.filter(
+					(warning) => !isGenericNoResults(id, warning),
+				);
 				reasons.push(
-					outcome.warnings.find((warning) =>
-						warning.endsWith(": no results"),
-					) ?? `${id}: no results`,
+					...(meaningful.length > 0 ? meaningful : providerWarnings),
 				);
 			}
 		} catch (error) {
-			const reason = prefixReason(id, messageOf(error));
+			const reason = prefixWarning(id, messageOf(error));
 			warnings.push(reason);
 			reasons.push(reason);
 		}

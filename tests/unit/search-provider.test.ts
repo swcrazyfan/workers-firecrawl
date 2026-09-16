@@ -113,6 +113,24 @@ describe("parseSearchChain", () => {
 		});
 	});
 
+	it("dedupes repeated ids, preserving the first occurrence", () => {
+		expect(parseSearchChain("browser,ddg,browser")).toEqual({
+			chain: ["browser", "ddg"],
+			warnings: [],
+		});
+	});
+
+	it("treats prototype-chain ids as unknown instead of resolving them", () => {
+		expect(parseSearchChain("constructor,toString,__proto__")).toEqual({
+			chain: [],
+			warnings: [
+				'unknown search provider "constructor" skipped',
+				'unknown search provider "tostring" skipped',
+				'unknown search provider "__proto__" skipped',
+			],
+		});
+	});
+
 	it("keeps searxng when SEARXNG_ENDPOINT is configured", () => {
 		expect(parseSearchChain("ddg,searxng", "https://sx.example")).toEqual({
 			chain: ["ddg", "searxng"],
@@ -127,16 +145,16 @@ describe("parseSearchChain", () => {
 		});
 	});
 
-	it("falls back to the default when the only provider is an unusable searxng", () => {
+	it("returns an empty chain when only searxng is configured without an endpoint", () => {
 		expect(parseSearchChain("searxng")).toEqual({
-			chain: ["ddg", "ddg-media", "browser"],
+			chain: [],
 			warnings: ["searxng skipped: SEARXNG_ENDPOINT not configured"],
 		});
 	});
 
-	it("falls back to the default when every id is unknown", () => {
+	it("returns an empty chain when every id is unknown", () => {
 		expect(parseSearchChain("bing,brave")).toEqual({
-			chain: ["ddg", "ddg-media", "browser"],
+			chain: [],
 			warnings: [
 				'unknown search provider "bing" skipped',
 				'unknown search provider "brave" skipped',
@@ -147,7 +165,7 @@ describe("parseSearchChain", () => {
 
 describe("searchWithFallback", () => {
 	beforeEach(() => {
-		vi.clearAllMocks();
+		vi.resetAllMocks();
 	});
 
 	it("serves web from ddg and stops the default chain early", async () => {
@@ -205,6 +223,14 @@ describe("searchWithFallback", () => {
 			{ ...input, sources: ["images"] },
 			env,
 		);
+	});
+
+	it("dedupes repeated chain ids so a provider is called once", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "ddg,ddg" });
+		vi.mocked(ddgWebSearch).mockResolvedValue(webOutcome(["https://a.com/1"]));
+		const outcome = await searchWithFallback(baseInput, env);
+		expect(ddgWebSearch).toHaveBeenCalledTimes(1);
+		expect(outcome.warnings).toEqual([]);
 	});
 
 	it("calls searxng only for sources ddg cannot serve", async () => {
@@ -401,5 +427,98 @@ describe("searchWithFallback", () => {
 		expect(outcome).toEqual({ results: {}, warnings: [] });
 		expect(ddgWebSearch).not.toHaveBeenCalled();
 		expect(ddgMediaSearch).not.toHaveBeenCalled();
+	});
+
+	it("throws a configuration error when searxng is configured without an endpoint", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "searxng" });
+		await expect(searchWithFallback(baseInput, env)).rejects.toThrow(
+			"no usable providers configured (SEARCH_CHAIN resolved empty); searxng skipped: SEARXNG_ENDPOINT not configured",
+		);
+		expect(searxngSearch).not.toHaveBeenCalled();
+	});
+
+	it("throws a configuration error when every configured id is unknown", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "bing,brave" });
+		await expect(searchWithFallback(baseInput, env)).rejects.toThrow(
+			'no usable providers configured (SEARCH_CHAIN resolved empty); unknown search provider "bing" skipped; unknown search provider "brave" skipped',
+		);
+	});
+
+	it("never crashes on prototype-chain ids in SEARCH_CHAIN", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "constructor,toString,__proto__" });
+		const error = await searchWithFallback(baseInput, env).catch(
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(SearchUnavailableError);
+		expect((error as Error).message).toContain(
+			"no usable providers configured",
+		);
+		expect((error as Error).message).not.toContain("TypeError");
+		expect(ddgWebSearch).not.toHaveBeenCalled();
+	});
+
+	it("carries the provider's real warning as the throw reason", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "ddg-media" });
+		vi.mocked(ddgMediaSearch).mockResolvedValue(
+			emptyOutcome("ddg-media: token not found"),
+		);
+		await expect(
+			searchWithFallback({ ...baseInput, sources: ["news"] }, env),
+		).rejects.toThrow(
+			"search backend unavailable: ddg-media: token not found",
+		);
+	});
+
+	it("prefers a per-source diagnostic over the generic no-results reason", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "ddg-media" });
+		vi.mocked(ddgMediaSearch).mockResolvedValue(
+			emptyOutcome("ddg-media news: 403 blocked", "ddg-media: no results"),
+		);
+		const error = await searchWithFallback(
+			{ ...baseInput, sources: ["news"] },
+			env,
+		).catch((caught: unknown) => caught);
+		expect((error as Error).message).toContain("ddg-media news: 403 blocked");
+		expect((error as Error).message).not.toContain("ddg-media: no results");
+	});
+
+	it("attributes success-path provider warnings with the provider id", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "ddg" });
+		vi.mocked(ddgWebSearch).mockResolvedValue({
+			results: webOutcome(["https://a.com/1"]).results,
+			warnings: ["qdr:h unsupported, using day", "ddg: already labelled"],
+		});
+		const outcome = await searchWithFallback(baseInput, env);
+		expect(outcome.warnings).toEqual([
+			"ddg: qdr:h unsupported, using day",
+			"ddg: already labelled",
+		]);
+	});
+
+	it("does not double-prefix warnings a provider already labels", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "browser" });
+		vi.mocked(ddgBrowserSearch).mockResolvedValue({
+			results: webOutcome(["https://b.com/1"]).results,
+			warnings: ["ddg-browser: query too long"],
+		});
+		const outcome = await searchWithFallback(baseInput, env);
+		expect(outcome.warnings).toEqual(["ddg-browser: query too long"]);
+	});
+
+	it("ignores and warns about sources a provider was not asked for", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "ddg" });
+		vi.mocked(ddgWebSearch).mockResolvedValue({
+			results: {
+				web: webOutcome(["https://a.com/1"]).results.web,
+				images: imageOutcome().results.images,
+			},
+			warnings: [],
+		});
+		const outcome = await searchWithFallback(baseInput, env);
+		expect(Object.keys(outcome.results)).toEqual(["web"]);
+		expect(outcome.results.images).toBeUndefined();
+		expect(outcome.warnings).toContain(
+			'ddg: ignoring unrequested source "images"',
+		);
 	});
 });
