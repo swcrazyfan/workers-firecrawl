@@ -1,4 +1,4 @@
-import { OpenAPIRoute, fromHono } from "chanfana";
+import { fromHono } from "chanfana";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { extractContent, getBrowser } from "../../src/browser";

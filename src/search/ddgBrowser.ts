@@ -17,10 +17,11 @@ const RESULT_TIMEOUT_MS = 10000;
 // DDG's SPA serves an empty shell to the default headless UA
 // (verified in production: results never render without this).
 // Legacy deployment proved this UA + viewport combination works — the news
-// tab renders under it too. Exported so /v1/search applies the same client.
+// tab renders under it too. Exported (frozen — shared client identity) so
+// /v1/search applies the same client.
 export const CHROME_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
-export const DESKTOP_VIEWPORT = { width: 1920, height: 1080 };
+export const DESKTOP_VIEWPORT = Object.freeze({ width: 1920, height: 1080 });
 
 // News-tab selectors kept in one exported place so production drift is a
 // one-line fix (production research: news results are `li > article`
