@@ -4,6 +4,7 @@ import { OpenAiProvider, buildRequestBody } from "../../src/ai/openaiProvider";
 import { getAiProvider } from "../../src/ai/provider";
 import {
 	type AiConfig,
+	type AiEnv,
 	AiConfigError,
 	type ChatRequest,
 } from "../../src/ai/types";
@@ -54,6 +55,24 @@ function callAt(
 ): { url: string; init: RequestInit } {
 	const calls = mock.mock.calls as unknown as [string, RequestInit][];
 	return { url: calls[index][0], init: calls[index][1] };
+}
+
+const CONSOLE_METHODS = ["log", "error", "warn", "info", "debug"] as const;
+
+function spyOnConsole(): { restore: () => void; serialized: () => string } {
+	const spies = CONSOLE_METHODS.map((method) =>
+		vi.spyOn(console, method).mockImplementation(() => {}),
+	);
+	return {
+		restore: () => {
+			for (const spy of spies) spy.mockRestore();
+		},
+		serialized: () =>
+			spies
+				.flatMap((spy) => spy.mock.calls)
+				.map((args) => JSON.stringify(args))
+				.join(" "),
+	};
 }
 
 describe("resolveAiConfig", () => {
@@ -163,6 +182,31 @@ describe("resolveAiConfig", () => {
 		expect(config.baseUrl).toBe("https://api.z.ai/api/paas/v4");
 		expect(config.model).toBe("glm-5.3-flash");
 	});
+
+	it("trims LLM_PROVIDER before comparing", () => {
+		const config = resolveAiConfig({ LLM_PROVIDER: "  openai  ", LLM_API_KEY: "k" });
+		expect(config.provider).toBe("openai");
+	});
+
+	it("tolerates case and whitespace in LLM_STRICT_JSON", () => {
+		expect(
+			resolveAiConfig({ LLM_API_KEY: "k", LLM_STRICT_JSON: "  ON " }).strictJson,
+		).toBe("on");
+		expect(
+			resolveAiConfig({ LLM_API_KEY: "k", LLM_STRICT_JSON: "Off" }).strictJson,
+		).toBe("off");
+		expect(
+			resolveAiConfig({ LLM_API_KEY: "k", LLM_STRICT_JSON: " AUTO " }).strictJson,
+		).toBe("auto");
+	});
+
+	it("caps an oversized timeout so AbortSignal.timeout cannot overflow", () => {
+		const config = resolveAiConfig({
+			LLM_API_KEY: "k",
+			LLM_TIMEOUT_MS: "99999999",
+		});
+		expect(config.timeoutMs).toBe(300000);
+	});
 });
 
 describe("buildRequestBody", () => {
@@ -232,30 +276,45 @@ describe("OpenAiProvider", () => {
 		});
 
 		it("returns content, usage and model on the happy path and sends auth", async () => {
-			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			fetchMock.mockResolvedValueOnce(jsonResponse(chatBody("hello")));
-			const provider = new OpenAiProvider(makeConfig());
-			const result = await provider.chat(baseRequest);
-			expect(result).toEqual({
-				content: "hello",
-				parsed: undefined,
-				usage: { inputTokens: 11, outputTokens: 7 },
-				model: "z-ai/glm-5.3-flash",
-				strictJson: true,
-			});
-			const { url, init } = callAt(fetchMock, 0);
-			expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
-			const headers = init.headers as Record<string, string>;
-			expect(headers.Authorization).toBe("Bearer sk-test-secret");
-			expect(headers["content-type"]).toBe("application/json");
-			expect(headers["HTTP-Referer"]).toBeDefined();
-			expect(headers["X-Title"]).toBeDefined();
-			expect(init.signal).toBeInstanceOf(AbortSignal);
-			const logged = [...logSpy.mock.calls, ...errorSpy.mock.calls]
-				.flat()
-				.join(" ");
-			expect(logged).not.toContain("sk-test-secret");
+			const console = spyOnConsole();
+			try {
+				fetchMock.mockResolvedValueOnce(jsonResponse(chatBody("hello")));
+				const provider = new OpenAiProvider(makeConfig());
+				const result = await provider.chat(baseRequest);
+				expect(result).toEqual({
+					content: "hello",
+					parsed: undefined,
+					usage: { inputTokens: 11, outputTokens: 7 },
+					model: "z-ai/glm-5.3-flash",
+					strictJson: true,
+				});
+				const { url, init } = callAt(fetchMock, 0);
+				expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
+				const headers = init.headers as Record<string, string>;
+				expect(headers.Authorization).toBe("Bearer sk-test-secret");
+				expect(headers["content-type"]).toBe("application/json");
+				expect(headers["HTTP-Referer"]).toBeDefined();
+				expect(headers["X-Title"]).toBeDefined();
+				expect(init.signal).toBeInstanceOf(AbortSignal);
+				expect(console.serialized()).not.toContain("sk-test-secret");
+			} finally {
+				console.restore();
+			}
+		});
+
+		it("never logs the API key on the error path", async () => {
+			const console = spyOnConsole();
+			try {
+				fetchMock.mockResolvedValueOnce(
+					jsonResponse({ error: { message: "bad request" } }, 400),
+				);
+				const provider = new OpenAiProvider(makeConfig());
+				await expect(provider.chat(baseRequest)).rejects.toThrow();
+				expect(console.serialized()).not.toContain("sk-test-secret");
+				expect(console.serialized()).not.toContain("Bearer");
+			} finally {
+				console.restore();
+			}
 		});
 
 		it("omits OpenRouter attribution headers for non-openrouter hosts", async () => {
@@ -267,6 +326,36 @@ describe("OpenAiProvider", () => {
 			const headers = callAt(fetchMock, 0).init.headers as Record<string, string>;
 			expect(headers["HTTP-Referer"]).toBeUndefined();
 			expect(headers["X-Title"]).toBeUndefined();
+		});
+
+		it("does not treat openrouter lookalike hosts as OpenRouter", async () => {
+			for (const baseUrl of [
+				"https://notopenrouter.ai/api/v1",
+				"https://openrouter.ai.evil.example/v1",
+			]) {
+				fetchMock.mockResolvedValueOnce(jsonResponse(chatBody("hi")));
+				const provider = new OpenAiProvider(makeConfig({ baseUrl }));
+				await provider.chat({ messages: baseRequest.messages });
+			}
+			for (const index of [0, 1]) {
+				const headers = callAt(fetchMock, index).init.headers as Record<
+					string,
+					string
+				>;
+				expect(headers["HTTP-Referer"]).toBeUndefined();
+				expect(headers["X-Title"]).toBeUndefined();
+			}
+		});
+
+		it("sets attribution headers on an openrouter.ai subdomain", async () => {
+			fetchMock.mockResolvedValueOnce(jsonResponse(chatBody("hi")));
+			const provider = new OpenAiProvider(
+				makeConfig({ baseUrl: "https://api.openrouter.ai/v1" }),
+			);
+			await provider.chat({ messages: baseRequest.messages });
+			const headers = callAt(fetchMock, 0).init.headers as Record<string, string>;
+			expect(headers["HTTP-Referer"]).toBeDefined();
+			expect(headers["X-Title"]).toBeDefined();
 		});
 
 		it("prefers message.parsed over content", async () => {
@@ -297,6 +386,36 @@ describe("OpenAiProvider", () => {
 			expect(second.response_format).toEqual({ type: "json_object" });
 		});
 
+		it("does not fall back when a 400 never references the schema param", async () => {
+			fetchMock.mockResolvedValueOnce(
+				jsonResponse({ error: { message: "invalid api key" } }, 400),
+			);
+			const provider = new OpenAiProvider(makeConfig());
+			await expect(provider.chat(baseRequest)).rejects.toThrow(/HTTP 400/);
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+		});
+
+		it("reports both the schema rejection and the fallback failure", async () => {
+			fetchMock
+				.mockResolvedValueOnce(
+					jsonResponse(
+						{ error: { message: "response_format not supported" } },
+						400,
+					),
+				)
+				.mockResolvedValueOnce(
+					jsonResponse({ error: { message: "json_object rejected" } }, 422),
+				);
+			const provider = new OpenAiProvider(makeConfig());
+			const error = await provider.chat(baseRequest).then(
+				() => null,
+				(e: unknown) => e as Error,
+			);
+			expect(error?.message).toContain("response_format not supported");
+			expect(error?.message).toContain("json_object rejected");
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		});
+
 		it("throws on a schema-rejection 400 when strictJson is on", async () => {
 			fetchMock.mockResolvedValueOnce(
 				jsonResponse({ error: { message: "json_schema unsupported" } }, 400),
@@ -316,6 +435,37 @@ describe("OpenAiProvider", () => {
 			vi.useFakeTimers();
 			const promise = provider.chat(baseRequest);
 			await vi.advanceTimersByTimeAsync(3000);
+			await expect(promise).resolves.toMatchObject({ content: "after" });
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		});
+
+		it("clamps a large Retry-After to the 5s cap", async () => {
+			fetchMock
+				.mockResolvedValueOnce(
+					jsonResponse({ error: "slow down" }, 429, { "Retry-After": "120" }),
+				)
+				.mockResolvedValueOnce(jsonResponse(chatBody("after")));
+			const provider = new OpenAiProvider(makeConfig());
+			vi.useFakeTimers();
+			const promise = provider.chat(baseRequest);
+			await vi.advanceTimersByTimeAsync(5000);
+			await expect(promise).resolves.toMatchObject({ content: "after" });
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		});
+
+		it("parses an HTTP-date Retry-After and clamps it to the cap", async () => {
+			const futureDate = new Date(Date.now() + 3600_000).toUTCString();
+			fetchMock
+				.mockResolvedValueOnce(
+					jsonResponse({ error: "slow down" }, 429, {
+						"Retry-After": futureDate,
+					}),
+				)
+				.mockResolvedValueOnce(jsonResponse(chatBody("after")));
+			const provider = new OpenAiProvider(makeConfig());
+			vi.useFakeTimers();
+			const promise = provider.chat(baseRequest);
+			await vi.advanceTimersByTimeAsync(5000);
 			await expect(promise).resolves.toMatchObject({ content: "after" });
 			expect(fetchMock).toHaveBeenCalledTimes(2);
 		});
@@ -360,12 +510,27 @@ describe("OpenAiProvider", () => {
 			await expect(promise).rejects.toThrow();
 			expect(fetchMock).toHaveBeenCalledTimes(2);
 		});
+
+		it("does not retry a caller-initiated abort", async () => {
+			const controller = new AbortController();
+			controller.abort();
+			fetchMock.mockRejectedValue(
+				new DOMException("The operation was aborted.", "AbortError"),
+			);
+			const provider = new OpenAiProvider(makeConfig());
+			await expect(
+				provider.chat({ ...baseRequest, signal: controller.signal }),
+			).rejects.toThrow();
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+		});
 	});
 });
 
 describe("getAiProvider", () => {
 	it("dispatches openai configs to OpenAiProvider and workers-ai to the seam", () => {
 		expect(getAiProvider(makeConfig(), {}).id).toBe("openai");
+		// Pass a stub binding so this stays green once 010b's real provider
+		// (whose constructor validates the binding) merges.
 		const workers = getAiProvider(
 			makeConfig({
 				provider: "workers-ai",
@@ -373,7 +538,7 @@ describe("getAiProvider", () => {
 				apiKey: undefined,
 				model: "@cf/meta/llama-3.1-8b-instruct",
 			}),
-			{},
+			{ AI: { run: vi.fn() } } as unknown as AiEnv,
 		);
 		expect(workers.id).toBe("workers-ai");
 	});

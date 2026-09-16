@@ -4,6 +4,7 @@ const DEFAULT_OPENAI_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_OPENAI_MODEL = "z-ai/glm-5.3-flash";
 const DEFAULT_WORKERS_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 const DEFAULT_TIMEOUT_MS = 20000;
+const MAX_TIMEOUT_MS = 300000;
 const DEFAULT_MAX_REPAIRS = 2;
 const DEFAULT_MAX_INPUT_CHARS = 48000;
 
@@ -12,7 +13,8 @@ function stripTrailingSlashes(value: string): string {
 }
 
 function resolveStrictJson(value: string | undefined): "auto" | "on" | "off" {
-	if (value === "on" || value === "off") return value;
+	const normalized = value?.trim().toLowerCase();
+	if (normalized === "on" || normalized === "off") return normalized;
 	return "auto";
 }
 
@@ -34,8 +36,8 @@ function selectProvider(
 	env: AiEnv,
 	key: string | undefined,
 ): "openai" | "workers-ai" {
-	const requested = env.LLM_PROVIDER;
-	if (requested !== undefined && requested.trim() !== "") {
+	const requested = env.LLM_PROVIDER?.trim();
+	if (requested !== undefined && requested !== "") {
 		if (requested === "openai" || requested === "workers-ai") return requested;
 		throw new AiConfigError(`unknown AI provider: ${requested}`);
 	}
@@ -54,7 +56,8 @@ export function resolveAiConfig(env: AiEnv): AiConfig {
 		env.LLM_TIMEOUT_MS,
 		DEFAULT_TIMEOUT_MS,
 		1000,
-		Number.MAX_SAFE_INTEGER,
+		// Cap so an enormous value cannot make AbortSignal.timeout throw RangeError.
+		MAX_TIMEOUT_MS,
 	);
 	const maxRepairs = resolveBoundedInt(
 		env.LLM_MAX_REPAIRS,

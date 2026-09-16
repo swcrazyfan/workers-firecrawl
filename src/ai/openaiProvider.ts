@@ -22,21 +22,53 @@ function isTransientStatus(status: number): boolean {
 
 function retryDelayMs(response: Response): number {
 	const header = response.headers.get("Retry-After");
-	if (header) {
-		const seconds = Number(header);
+	if (header !== null) {
+		// Retry-After is either delta-seconds or an HTTP-date; clamp either form.
+		const seconds = Number(header.trim());
 		if (Number.isFinite(seconds) && seconds >= 0) {
 			return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+		}
+		const date = Date.parse(header);
+		if (!Number.isNaN(date)) {
+			return Math.min(Math.max(date - Date.now(), 0), MAX_RETRY_AFTER_MS);
 		}
 	}
 	return RETRY_DELAY_MS;
 }
 
+function errorName(error: unknown): string | undefined {
+	if (typeof error === "object" && error !== null && "name" in error) {
+		const name = (error as { name?: unknown }).name;
+		return typeof name === "string" ? name : undefined;
+	}
+	return undefined;
+}
+
+// Caller-initiated aborts must surface immediately; only the provider's own
+// timeout (name "TimeoutError") is retryable as a transient failure.
+function isCallerAbort(error: unknown, req: ChatRequest): boolean {
+	if (req.signal?.aborted !== true) return false;
+	return errorName(error) !== "TimeoutError";
+}
+
 function isOpenRouter(baseUrl: string): boolean {
 	try {
-		return new URL(baseUrl).host.includes("openrouter.ai");
+		const host = new URL(baseUrl).hostname.toLowerCase();
+		return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
 	} catch {
 		return false;
 	}
+}
+
+// Heuristic for "the endpoint rejected the structured-output parameter": the
+// body must name response_format/json_schema AND carry a rejection cue, so an
+// unrelated 400 that mentions neither never triggers the json_object retry.
+const SCHEMA_PARAM_RE = /response[_ ]?format|json_schema/i;
+const SCHEMA_REJECTION_RE =
+	/unsupported|invalid|not supported|unknown|unrecognized/i;
+
+function mentionsSchemaRejection(body: string): boolean {
+	return SCHEMA_PARAM_RE.test(body) && SCHEMA_REJECTION_RE.test(body);
 }
 
 // AbortSignal.any ships in the Workers runtime and modern Node, but is absent
@@ -79,6 +111,8 @@ export function buildRequestBody(
 		model: config.model,
 		messages: req.messages,
 		temperature: req.temperature ?? 0,
+		// Some newer OpenAI-family models require `max_completion_tokens`;
+		// GLM served by z.ai/OpenRouter accepts `max_tokens`.
 		max_tokens: req.maxTokens ?? DEFAULT_MAX_TOKENS,
 	};
 	if (req.jsonSchema !== undefined) {
@@ -133,7 +167,7 @@ export class OpenAiProvider implements AiProvider {
 				if (!fallback.ok) {
 					const fallbackBody = await fallback.text().catch(() => "");
 					throw new Error(
-						`ai: ${this.id} HTTP ${fallback.status}${fallbackBody ? `: ${fallbackBody}` : ""}`,
+						`ai: ${this.id} json_schema request failed with HTTP ${response.status}${body ? `: ${body}` : ""}; json_object fallback failed with HTTP ${fallback.status}${fallbackBody ? `: ${fallbackBody}` : ""}`,
 					);
 				}
 				return await this.parse(fallback, false);
@@ -156,7 +190,7 @@ export class OpenAiProvider implements AiProvider {
 			status === 400 &&
 			setting === "auto" &&
 			req.jsonSchema !== undefined &&
-			/response_format|json_schema/.test(body)
+			mentionsSchemaRejection(body)
 		);
 	}
 
@@ -182,7 +216,8 @@ export class OpenAiProvider implements AiProvider {
 	): Promise<Response | null> {
 		try {
 			return await this.send(body, req);
-		} catch {
+		} catch (error) {
+			if (isCallerAbort(error, req)) throw error;
 			return null;
 		}
 	}
