@@ -1,6 +1,11 @@
 import { OpenAPIRoute, contentJson } from "chanfana";
 import { z } from "zod";
-import { createJob, enqueueUrls, setJobStatus } from "../crawler/store";
+import {
+	bumpJobCounters,
+	createJob,
+	enqueueUrls,
+	setJobStatus,
+} from "../crawler/store";
 import type { AppContext } from "../index";
 import { scrapeFormatSchema } from "./scrape";
 
@@ -29,7 +34,6 @@ const IGNORED_FIELDS = [
 	"maxConcurrency",
 	"prompt",
 	"regexOnFullURL",
-	"robotsUserAgent",
 	"zeroDataRetention",
 ] as const;
 
@@ -134,6 +138,7 @@ export class V2Crawl extends OpenAPIRoute {
 		const now = Date.now();
 		const jobId = randomJobId(now);
 		const expiresAt = now + JOB_TTL_MS;
+		const sitemap = body.sitemap ?? "include";
 
 		// The schema mirrors src/v2/scrape.ts (`.default(x).optional()`), where
 		// the default is nominal and consumers resolve it with `??`. Persist the
@@ -145,7 +150,7 @@ export class V2Crawl extends OpenAPIRoute {
 			allowExternalLinks: body.allowExternalLinks ?? false,
 			allowSubdomains: body.allowSubdomains ?? false,
 			ignoreRobotsTxt: body.ignoreRobotsTxt ?? false,
-			sitemap: body.sitemap ?? "include",
+			sitemap,
 		};
 
 		// The job row is the anchor for every later step: if it cannot be written
@@ -167,8 +172,21 @@ export class V2Crawl extends OpenAPIRoute {
 
 		// The row exists now, so a failed seed enqueue is recoverable: mark the job
 		// failed so it is never left stuck in `scraping`, then surface the error.
+		// `sitemap:"only"` deliberately does not enqueue the seed: only sitemap
+		// URLs are crawled. The seed is otherwise enqueued here (before the
+		// workflow's sitemap URLs) and counted toward `total`.
 		try {
-			await enqueueUrls(c.env.DB, jobId, [{ url: body.url, depth: 0 }], now);
+			if (sitemap !== "only") {
+				const seeded = await enqueueUrls(
+					c.env.DB,
+					jobId,
+					[{ url: body.url, depth: 0 }],
+					now,
+				);
+				if (seeded > 0) {
+					await bumpJobCounters(c.env.DB, jobId, { total: seeded, now });
+				}
+			}
 		} catch (error) {
 			console.error(
 				`Crawl seed enqueue failed for ${jobId}: ${(error as Error).message}`,

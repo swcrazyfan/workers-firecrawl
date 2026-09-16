@@ -219,6 +219,26 @@ export async function markQueueItem(
 		.run();
 }
 
+// Releases claimed-but-unfinished rows back to `pending`. Only rows still in
+// `processing` are touched, so items already marked done/failed are preserved.
+// Used to make a retried Workflow batch idempotent: a step that throws after
+// `claimNextBatch` must not orphan its rows, and a batch stopped by `limit`
+// must return its remainder to the queue.
+export async function resetQueueItems(
+	db: D1Database,
+	ids: number[],
+): Promise<void> {
+	if (ids.length === 0) return;
+	const placeholders = ids.map(() => "?").join(", ");
+	await db
+		.prepare(
+			`UPDATE crawl_queue SET status = 'pending'
+			 WHERE status = 'processing' AND id IN (${placeholders})`,
+		)
+		.bind(...ids)
+		.run();
+}
+
 export async function pendingQueueCount(
 	db: D1Database,
 	jobId: string,
