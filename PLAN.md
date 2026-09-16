@@ -66,14 +66,14 @@ docs/specs/              # per-task implementation specs (agents read these)
 | 002 | ✅ Search params (kl tables, tbs mappers) (PR #2) | `src/search/params.ts` + test | — | 1 |
 | 003 | ✅ SearXNG provider (PR #3) — retained as OPTIONAL backend, not in default chain | `src/search/types.ts`, `src/search/searxng.ts`, `Env` + tests | 002 (contract) | 1 |
 | 004 | ✅ DDG fetch provider (PR #5) | `src/search/ddg.ts` + fixtures/tests | 002 | 2 |
-| 005 | Configurable chain (SEARCH_CHAIN, per-source) | `src/search/provider.ts`, `src/search/ddgBrowser.ts` | 004, 007 (contract) | 2 |
-| 007 | DDG vqd media provider (news+images) | `src/search/ddgMedia.ts` + tests | 002 | 2 |
-| 006 | `/v2/search` route | `src/v2/search.ts`, `src/index.ts` | 005 | 2 |
-| 007 | `/v2/map` route | `src/v2/map.ts`, `src/crawler/sitemap.ts` | — | 3 |
-| 008 | `/v2/scrape` format objects (no AI) | `src/v2/scrape.ts` | — | 3 |
-| 009a | AI: types/config/provider iface + OpenAI-compat | `src/ai/*` partial | — | 3 |
-| 009b | AI: Workers AI provider | `src/ai/workersAiProvider.ts` | 009a | 3 |
-| 009c | AI: extract pipeline + prompts + scrape wiring | `src/ai/extract.ts`, `prompt.ts`, `src/v2/scrape.ts` | 009a, 008 | 4 |
+| 005 | ✅ Configurable chain, SEARCH_CHAIN per-source (PR #6) | `src/search/provider.ts`, `src/search/ddgBrowser.ts` | 004, 007 (contract) | 2 |
+| 007 | ✅ DDG vqd media provider (PR #7) | `src/search/ddgMedia.ts` + tests | 002 | 2 |
+| 006 | ✅ `/v2/search` route (PR #8) | `src/v2/search.ts`, `src/index.ts` | 005 | 2 |
+| 008 | ✅ `/v2/map` route + sitemap parser (PR #10) | `src/v2/map.ts`, `src/crawler/sitemap.ts` | — | 3 |
+| 009 | ✅ `/v2/scrape` format objects (PR #9) | `src/v2/scrape.ts` | — | 3 |
+| 010a | AI: types/config/provider iface + OpenAI-compat | `src/ai/*` partial | — | 4 |
+| 010b | AI: Workers AI provider | `src/ai/workersAiProvider.ts` | 010a | 4 |
+| 010c | AI: extract pipeline + prompts + scrape wiring | `src/ai/extract.ts`, `prompt.ts`, `src/v2/scrape.ts` | 010a/b, 009 | 4 |
 | 010 | robots + sitemap utils | `src/crawler/robots.ts`, `src/crawler/sitemap.ts` | — | 3 |
 | 011 | D1 schema + crawl endpoints | `migrations/`, `src/v2/crawl*.ts` | — | 4 |
 | 012 | Crawl Workflow + batch engine | `src/crawler/workflow.ts`, `batch.ts`, wrangler wiring | 010, 011, 009c | 4 |
