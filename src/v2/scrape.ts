@@ -9,6 +9,10 @@ import type { AppContext } from "../index";
 // zeroDataRetention, threatProtection, auditMetadata, skipTlsVerification.
 // `includeTags`/`excludeTags`, `mobile`, `removeBase64Images` and `blockAds`
 // are also accepted but not applied by `extractContent` today.
+//
+// Formats this deployment does not implement are accepted and reported through
+// `data.warning` (see UNIMPLEMENTED_FORMATS) rather than rejected, matching the
+// SDK compatibility contract.
 
 export class FormatValidationError extends Error {
 	constructor(message: string) {
@@ -20,18 +24,37 @@ export class FormatValidationError extends Error {
 export interface NormalizedFormats {
 	strings: string[];
 	screenshotFullPage: boolean;
+	screenshotOptionsIgnored: boolean;
 	wantsJson: { schema?: unknown; prompt?: string } | null;
 	wantsSummary: boolean;
 	warnings: string[];
 }
 
-const KNOWN_STRING_FORMATS = [
+const SUPPORTED_STRING_FORMATS = [
 	"markdown",
 	"html",
 	"rawHtml",
 	"links",
 	"screenshot",
 	"summary",
+] as const;
+
+// Object forms of the string-only formats the pipeline can actually serve.
+const OBJECT_STRING_FORMATS = ["markdown", "html", "rawHtml", "links"] as const;
+
+// Part of the v2 contract that this deployment does not fetch or return. They
+// are accepted (string or object form) and surfaced as a warning.
+const UNIMPLEMENTED_FORMATS = [
+	"images",
+	"rawBase64",
+	"changeTracking",
+	"branding",
+	"product",
+	"menu",
+	"audio",
+	"video",
+	"question",
+	"highlights",
 ] as const;
 
 const LEGACY_FULL_PAGE_WARNING =
@@ -41,6 +64,7 @@ export function normalizeFormats(input: unknown[]): NormalizedFormats {
 	const strings: string[] = [];
 	const warnings: string[] = [];
 	let screenshotFullPage = false;
+	let screenshotOptionsIgnored = false;
 	let wantsJson: { schema?: unknown; prompt?: string } | null = null;
 	let wantsSummary = false;
 
@@ -49,18 +73,25 @@ export function normalizeFormats(input: unknown[]): NormalizedFormats {
 			strings.push(format);
 		}
 	};
+	const warnOnce = (warning: string) => {
+		if (!warnings.includes(warning)) {
+			warnings.push(warning);
+		}
+	};
 
 	for (const format of input) {
 		if (typeof format === "string") {
 			if (format === "screenshot@fullPage") {
 				screenshotFullPage = true;
 				addString("screenshot");
-				if (!warnings.includes(LEGACY_FULL_PAGE_WARNING)) {
-					warnings.push(LEGACY_FULL_PAGE_WARNING);
-				}
+				warnOnce(LEGACY_FULL_PAGE_WARNING);
 				continue;
 			}
-			if (!(KNOWN_STRING_FORMATS as readonly string[]).includes(format)) {
+			if ((UNIMPLEMENTED_FORMATS as readonly string[]).includes(format)) {
+				warnOnce(`format ${format} is not supported by this deployment`);
+				continue;
+			}
+			if (!(SUPPORTED_STRING_FORMATS as readonly string[]).includes(format)) {
 				throw new FormatValidationError(`Unsupported format: ${format}`);
 			}
 			addString(format);
@@ -68,15 +99,32 @@ export function normalizeFormats(input: unknown[]): NormalizedFormats {
 		}
 
 		if (format !== null && typeof format === "object") {
-			const typed = format as { type?: unknown; fullPage?: unknown };
-			if (typed.type === "screenshot") {
+			const typed = format as {
+				type?: unknown;
+				fullPage?: unknown;
+				quality?: unknown;
+				viewport?: unknown;
+			};
+			const type = typed.type;
+
+			if (
+				typeof type === "string" &&
+				(UNIMPLEMENTED_FORMATS as readonly string[]).includes(type)
+			) {
+				warnOnce(`format ${type} is not supported by this deployment`);
+				continue;
+			}
+			if (type === "screenshot") {
 				addString("screenshot");
 				if (typed.fullPage === true) {
 					screenshotFullPage = true;
 				}
+				if (typed.quality !== undefined || typed.viewport !== undefined) {
+					screenshotOptionsIgnored = true;
+				}
 				continue;
 			}
-			if (typed.type === "json") {
+			if (type === "json") {
 				const { schema, prompt } = format as {
 					schema?: unknown;
 					prompt?: unknown;
@@ -90,9 +138,16 @@ export function normalizeFormats(input: unknown[]): NormalizedFormats {
 				}
 				continue;
 			}
-			if (typed.type === "summary") {
+			if (type === "summary") {
 				wantsSummary = true;
 				addString("summary");
+				continue;
+			}
+			if (
+				typeof type === "string" &&
+				(OBJECT_STRING_FORMATS as readonly string[]).includes(type)
+			) {
+				addString(type);
 				continue;
 			}
 		}
@@ -102,7 +157,14 @@ export function normalizeFormats(input: unknown[]): NormalizedFormats {
 		);
 	}
 
-	return { strings, screenshotFullPage, wantsJson, wantsSummary, warnings };
+	return {
+		strings,
+		screenshotFullPage,
+		screenshotOptionsIgnored,
+		wantsJson,
+		wantsSummary,
+		warnings,
+	};
 }
 
 function buildWarning(warnings: string[]): string | undefined {
@@ -116,25 +178,27 @@ export class V2Scrape extends OpenAPIRoute {
 				content: {
 					"application/json": {
 						schema: z.object({
-							url: z.string(),
+							url: z.string().url(),
 							formats: z
 								.array(
 									z.union([
-										z.enum([
-											"markdown",
-											"html",
-											"rawHtml",
-											"links",
-											"screenshot",
-											"summary",
+										z.union([
+											z.enum(SUPPORTED_STRING_FORMATS),
+											z.enum(UNIMPLEMENTED_FORMATS),
 											// Legacy v1 alias: accepted and normalized to a
 											// full-page screenshot with a warning.
-											"screenshot@fullPage",
+											z.literal("screenshot@fullPage"),
 										]),
 										z.object({
 											type: z.literal("screenshot"),
 											fullPage: z.boolean().optional(),
 											quality: z.number().int().min(1).max(100).optional(),
+											viewport: z
+												.object({
+													width: z.number().int(),
+													height: z.number().int(),
+												})
+												.optional(),
 										}),
 										z.object({
 											type: z.literal("json"),
@@ -142,13 +206,21 @@ export class V2Scrape extends OpenAPIRoute {
 											prompt: z.string().optional(),
 										}),
 										z.object({ type: z.literal("summary") }),
+										z.object({ type: z.enum(OBJECT_STRING_FORMATS) }),
+										z.object({ type: z.enum(UNIMPLEMENTED_FORMATS) }),
 									]),
 								)
 								.default(["markdown"])
 								.optional(),
 							onlyMainContent: z.boolean().default(true).optional(),
 							waitFor: z.number().default(0).optional(),
-							timeout: z.number().optional(),
+							timeout: z
+								.number()
+								.int()
+								.min(1000)
+								.max(300000)
+								.default(60000)
+								.optional(),
 							headers: z.record(z.string()).optional(),
 							includeTags: z.string().array().optional(),
 							excludeTags: z.string().array().optional(),
@@ -182,8 +254,8 @@ export class V2Scrape extends OpenAPIRoute {
 							language: z.string().optional(),
 							keywords: z.string().optional(),
 						}),
+						warning: z.string().nullable().optional(),
 					}),
-					warning: z.string().optional(),
 				}),
 			},
 			500: {
@@ -214,6 +286,9 @@ export class V2Scrape extends OpenAPIRoute {
 		}
 
 		const warnings = [...normalized.warnings];
+		if (normalized.screenshotOptionsIgnored) {
+			warnings.push("screenshot quality/viewport options are ignored");
+		}
 		if (normalized.wantsJson) {
 			warnings.push(
 				"json format requires AI configuration (not yet available)",
@@ -235,15 +310,32 @@ export class V2Scrape extends OpenAPIRoute {
 					: format,
 			);
 
-		const browser = await getBrowser(c.env);
+		// A launch failure must still produce the documented 500 envelope rather
+		// than an unhandled Hono error.
+		let browser: Awaited<ReturnType<typeof getBrowser>>;
 		try {
+			browser = await getBrowser(c.env);
+		} catch (error) {
+			console.error(
+				`Browser launch failed for ${body.url}: ${(error as Error).message}`,
+			);
+			return Response.json(
+				{ success: false, error: "Failed to scrape URL" },
+				{ status: 500 },
+			);
+		}
+
+		try {
+			// Kept even though the real pipeline reports failures as `null`: a
+			// throwing `extractContent` (or a future implementation) must map to
+			// the same 500 envelope instead of escaping Hono.
 			let result: Awaited<ReturnType<typeof extractContent>> = null;
 			try {
 				result = await extractContent(browser, body.url, {
 					formats: extractFormats,
 					onlyMainContent: body.onlyMainContent ?? true,
 					waitFor: body.waitFor,
-					timeout: body.timeout,
+					timeout: body.timeout ?? 60000,
 					headers: body.headers,
 				});
 			} catch (error) {
@@ -279,19 +371,17 @@ export class V2Scrape extends OpenAPIRoute {
 				responseData.screenshot = result.screenshot;
 			}
 
-			const payload: {
-				success: true;
-				data: Record<string, unknown>;
-				warning?: string;
-			} = {
+			// The v2 scrape contract carries warnings inside `data` (unlike
+			// /v2/search, which uses a top-level `warning`).
+			const warning = buildWarning(warnings);
+			if (warning !== undefined) {
+				responseData.warning = warning;
+			}
+
+			return {
 				success: true,
 				data: responseData,
 			};
-			const warning = buildWarning(warnings);
-			if (warning !== undefined) {
-				payload.warning = warning;
-			}
-			return payload;
 		} finally {
 			await browser.close();
 		}
