@@ -1,5 +1,6 @@
 import { OpenAPIRoute, contentJson } from "chanfana";
 import { z } from "zod";
+import { extractStructured, summarize } from "../ai/extract";
 import { extractContent, getBrowser } from "../browser";
 import type { AppContext } from "../index";
 
@@ -171,6 +172,12 @@ function buildWarning(warnings: string[]): string | undefined {
 	return warnings.length > 0 ? warnings.join("; ") : undefined;
 }
 
+function asJsonSchema(schema: unknown): Record<string, unknown> | undefined {
+	return schema !== null && typeof schema === "object" && !Array.isArray(schema)
+		? (schema as Record<string, unknown>)
+		: undefined;
+}
+
 export class V2Scrape extends OpenAPIRoute {
 	schema = {
 		request: {
@@ -289,16 +296,6 @@ export class V2Scrape extends OpenAPIRoute {
 		if (normalized.screenshotOptionsIgnored) {
 			warnings.push("screenshot quality/viewport options are ignored");
 		}
-		if (normalized.wantsJson) {
-			warnings.push(
-				"json format requires AI configuration (not yet available)",
-			);
-		}
-		if (normalized.wantsSummary) {
-			warnings.push(
-				"summary format requires AI configuration (not yet available)",
-			);
-		}
 
 		// `extractContent` still speaks the v1 format vocabulary; translate the
 		// v2 screenshot object into the legacy full-page marker it understands.
@@ -309,6 +306,14 @@ export class V2Scrape extends OpenAPIRoute {
 					? "screenshot@fullPage"
 					: format,
 			);
+		// The AI formats extract from markdown, so make sure it is produced even
+		// when the caller did not ask for the markdown output key.
+		if (
+			(normalized.wantsJson !== null || normalized.wantsSummary) &&
+			!extractFormats.includes("markdown")
+		) {
+			extractFormats.push("markdown");
+		}
 
 		// A launch failure must still produce the documented 500 envelope rather
 		// than an unhandled Hono error.
@@ -369,6 +374,40 @@ export class V2Scrape extends OpenAPIRoute {
 			}
 			if (normalized.strings.includes("screenshot")) {
 				responseData.screenshot = result.screenshot;
+			}
+
+			// AI formats degrade to a warning on a still-200 response; the
+			// extraction pipeline never throws, and this guard keeps an
+			// unexpected failure from turning the scrape into a 500.
+			const markdown = result.markdown ?? "";
+			try {
+				if (normalized.wantsJson !== null) {
+					const json = await extractStructured(
+						{
+							content: markdown,
+							jsonSchema: asJsonSchema(normalized.wantsJson.schema),
+							prompt: normalized.wantsJson.prompt,
+						},
+						c.env,
+					);
+					if (json.data !== undefined) {
+						responseData.json = json.data;
+					}
+					if (json.warning !== undefined) {
+						warnings.push(json.warning);
+					}
+				}
+				if (normalized.wantsSummary) {
+					const summary = await summarize({ content: markdown }, c.env);
+					if (summary.summary !== undefined) {
+						responseData.summary = summary.summary;
+					}
+					if (summary.warning !== undefined) {
+						warnings.push(summary.warning);
+					}
+				}
+			} catch (error) {
+				warnings.push(`AI extraction failed: ${(error as Error).message}`);
 			}
 
 			// The v2 scrape contract carries warnings inside `data` (unlike
