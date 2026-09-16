@@ -15,6 +15,16 @@ export type Env = {
 	SEARXNG_ENDPOINT?: string;
 	SEARXNG_ENGINES?: string;
 	SEARXNG_HEADERS?: string; // JSON object of extra headers (CF Access etc.)
+	AI?: unknown; // Workers AI binding (provider: "workers-ai")
+	LLM_PROVIDER?: string; // "openai" | "workers-ai"
+	LLM_BASE_URL?: string; // OpenAI-compatible base URL (default OpenRouter)
+	LLM_MODEL?: string;
+	LLM_API_KEY?: string;
+	OPENAI_API_KEY?: string;
+	LLM_STRICT_JSON?: string; // "auto" | "on" | "off"
+	LLM_TIMEOUT_MS?: string;
+	LLM_MAX_REPAIRS?: string;
+	LLM_MAX_INPUT_CHARS?: string;
 };
 export type AppContext = Context<{ Bindings: Env }>;
 
