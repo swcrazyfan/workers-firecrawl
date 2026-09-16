@@ -3,11 +3,11 @@ import { OpenAPIRoute, contentJson } from "chanfana";
 import { z } from "zod";
 import type { AppContext, Env } from "./index";
 
-async function getBrowser(env: Env): Promise<Browser> {
+export async function getBrowser(env: Env): Promise<Browser> {
 	return await puppeteer.launch(env.BROWSER);
 }
 
-async function discoverLinks(
+export async function discoverLinks(
 	browser: Browser,
 	url: string,
 	includeSubdomains: boolean,
