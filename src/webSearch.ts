@@ -4,10 +4,15 @@ import { z } from "zod";
 import { extractContent, getBrowser } from "./browser";
 import { DEFAULT_FORMATS } from "./constants";
 import type { AppContext } from "./index";
+import { CHROME_UA, DESKTOP_VIEWPORT } from "./search/ddgBrowser";
 
 async function performSearch(browser: Browser, query: string, limit: number) {
 	const page = await browser.newPage();
 	try {
+		// DDG serves an empty shell to the default headless client — the v2
+		// browser provider proved this viewport + UA combination (spec 015).
+		await page.setViewport({ ...DESKTOP_VIEWPORT });
+		await page.setUserAgent(CHROME_UA);
 		const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query)}`;
 		await page.goto(searchUrl, { waitUntil: "domcontentloaded" });
 		await page.waitForSelector('[data-testid="result-title-a"]', {
