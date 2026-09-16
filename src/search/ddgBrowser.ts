@@ -31,8 +31,6 @@ export const DDG_NEWS_SELECTORS = {
 	image: "article img[src]",
 } as const;
 
-// Keep in sync with the duplicated literal inside the news extraction
-// callback below — evaluate callbacks cannot close over module scope.
 const RELATIVE_TIME_PATTERN =
 	/(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago/i;
 
@@ -166,6 +164,7 @@ async function webItems(
 		await page.setUserAgent(CHROME_UA);
 		await page.goto(`https://duckduckgo.com/?${ddgParams(input).toString()}`, {
 			waitUntil: "domcontentloaded",
+			timeout: 30000,
 		});
 		try {
 			// Wait for result title links
@@ -214,7 +213,7 @@ async function newsItems(
 		await page.setUserAgent(CHROME_UA);
 		await page.goto(
 			`https://duckduckgo.com/?${ddgParams(input, { iar: "news", ia: "news" }).toString()}`,
-			{ waitUntil: "domcontentloaded" },
+			{ waitUntil: "domcontentloaded", timeout: 30000 },
 		);
 		try {
 			// Wait for news article elements
@@ -225,32 +224,44 @@ async function newsItems(
 			// Same swallow-to-empty semantics as the web path.
 		}
 
-		const raw: RawNewsItem[] = await page.evaluate((selectors) => {
-			const articles = Array.from(
-				document.querySelectorAll<HTMLElement>(selectors.article),
-			);
-			return articles.map((article) => {
-				const anchor = article.querySelector<HTMLAnchorElement>(selectors.link);
-				const image = article.querySelector<HTMLImageElement>(selectors.image);
-				const text = article.innerText.trim();
-				const title = anchor === null ? "" : anchor.innerText.trim();
-				const snippet =
-					title !== "" && text.startsWith(title)
-						? text.slice(title.length)
-						: text;
-				// Keep this literal in sync with RELATIVE_TIME_PATTERN.
-				const ago = text.match(
-					/(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago/i,
+		const raw: RawNewsItem[] = await page.evaluate(
+			(selectors, timePatternSource) => {
+				const articles = Array.from(
+					document.querySelectorAll<HTMLElement>(selectors.article),
 				);
-				return {
-					url: anchor === null ? "" : anchor.href,
-					title: title,
-					snippet: snippet,
-					timestamp: ago === null ? null : (ago[0] ?? null),
-					image: image === null ? null : image.src,
-				};
-			});
-		}, DDG_NEWS_SELECTORS);
+				return articles.map((article) => {
+					const anchor = article.querySelector<HTMLAnchorElement>(
+						selectors.link,
+					);
+					const image = article.querySelector<HTMLImageElement>(
+						selectors.image,
+					);
+					const text = article.innerText.trim();
+					const title = anchor === null ? "" : anchor.innerText.trim();
+					// Line-based: the title can sit anywhere in the article text
+					// (publisher/timestamp lines often come first), so drop the
+					// line equal to the title instead of assuming a prefix.
+					const snippet =
+						title !== ""
+							? text
+									.split("\n")
+									.filter((line) => line.trim() !== title)
+									.join("\n")
+							: text;
+					const timePattern = new RegExp(timePatternSource, "i");
+					const ago = text.match(timePattern);
+					return {
+						url: anchor === null ? "" : anchor.href,
+						title: title,
+						snippet: snippet,
+						timestamp: ago === null ? null : ago[0],
+						image: image === null ? null : image.src,
+					};
+				});
+			},
+			DDG_NEWS_SELECTORS,
+			RELATIVE_TIME_PATTERN.source,
+		);
 
 		const validated: NewsResult[] = dedupeUrls(raw).flatMap((item, index) => {
 			const candidate: NewsResult = {
@@ -293,30 +304,41 @@ export async function ddgBrowserSearch(
 		return { results: {}, warnings };
 	}
 
-	const browser = await getBrowser(env);
-	const results: SearchResults = {};
+	// Only the browser launch can fail the whole chain: a source that throws
+	// after launch is isolated so the other source's results survive (a
+	// partial success must not regress into a 503).
+	let browser: Browser;
 	try {
-		for (const source of sources) {
-			if (source === "web") {
-				const items = await webItems(browser, input);
-				if (items.length === 0) {
-					warnings.push("ddg-browser: no results");
-					continue;
-				}
-				results.web = items;
-			} else {
-				const items = await newsItems(browser, input);
-				if (items.length === 0) {
-					warnings.push("ddg-browser: no results");
-					continue;
-				}
-				results.news = items;
-			}
-		}
-		return { results, warnings };
+		browser = await getBrowser(env);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`ddg-browser: search failed: ${message}`);
+	}
+	const results: SearchResults = {};
+	try {
+		for (const source of sources) {
+			try {
+				if (source === "web") {
+					const items = await webItems(browser, input);
+					if (items.length === 0) {
+						warnings.push("ddg-browser: no results");
+						continue;
+					}
+					results.web = items;
+				} else {
+					const items = await newsItems(browser, input);
+					if (items.length === 0) {
+						warnings.push("ddg-browser: no results");
+						continue;
+					}
+					results.news = items;
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				warnings.push(`ddg-browser: ${source} failed: ${message}`);
+			}
+		}
+		return { results, warnings };
 	} finally {
 		// Upstream bug e836594 leaked the browser on every failed search —
 		// close it no matter how the attempt ends.

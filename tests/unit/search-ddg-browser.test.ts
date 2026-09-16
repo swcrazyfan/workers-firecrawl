@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getBrowser } from "../../src/browser";
 import type { Env } from "../../src/index";
 import { ddgBrowserSearch } from "../../src/search/ddgBrowser";
@@ -45,9 +45,41 @@ function stubBrowser(browser: ReturnType<typeof makeBrowser>["browser"]) {
 	vi.mocked(getBrowser).mockResolvedValue(browser as never);
 }
 
+// Minimal element stubs so the real evaluate callbacks can run in-page
+// style: the callback only needs querySelectorAll/querySelector, innerText,
+// href and src.
+function fakeNewsArticle(options: {
+	text: string;
+	anchors?: Array<{ href: string; innerText: string }>;
+	image?: { src: string };
+}) {
+	const anchors = options.anchors ?? [];
+	return {
+		innerText: options.text,
+		querySelector: (selector: string) => {
+			if (selector.includes("a[href]")) return anchors[0] ?? null;
+			if (selector.includes("img[src]")) return options.image ?? null;
+			return null;
+		},
+	};
+}
+
+// Runs the real evaluate callback (fn) with the real serialized arguments
+// instead of faking its return value.
+function evaluateInPage(page: ReturnType<typeof makeBrowser>["page"]) {
+	page.evaluate.mockImplementation(
+		async (fn: (...args: unknown[]) => unknown, ...args: unknown[]) =>
+			fn(...args),
+	);
+}
+
 describe("ddgBrowserSearch", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
+	});
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
 	});
 
 	it("navigates with the mapped query parameters and waits for results", async () => {
@@ -84,16 +116,25 @@ describe("ddgBrowserSearch", () => {
 		expect(browser.close).toHaveBeenCalled();
 	});
 
-	it("wraps navigation errors and still closes the page and browser", async () => {
+	it("isolates a navigation failure into a per-source warning and still closes the page and browser", async () => {
 		const { browser, page } = makeBrowser();
 		page.goto.mockRejectedValue(new Error("net::ERR_CONNECTION_REFUSED"));
 		stubBrowser(browser);
-		await expect(ddgBrowserSearch(input, makeEnv())).rejects.toThrow(
-			"ddg-browser: search failed: net::ERR_CONNECTION_REFUSED",
-		);
+		const outcome = await ddgBrowserSearch(input, makeEnv());
+		expect(outcome).toEqual({
+			results: {},
+			warnings: ["ddg-browser: web failed: net::ERR_CONNECTION_REFUSED"],
+		});
 		expect(page.waitForSelector).not.toHaveBeenCalled();
 		expect(page.close).toHaveBeenCalled();
 		expect(browser.close).toHaveBeenCalled();
+	});
+
+	it("still throws when the browser launch itself fails", async () => {
+		vi.mocked(getBrowser).mockRejectedValue(new Error("no binder"));
+		await expect(ddgBrowserSearch(input, makeEnv())).rejects.toThrow(
+			"ddg-browser: search failed: no binder",
+		);
 	});
 
 	it("dedupes normalized URLs, drops non-http results and renumbers positions 1..N", async () => {
@@ -115,13 +156,15 @@ describe("ddgBrowserSearch", () => {
 		expect(page.evaluate).toHaveBeenCalledTimes(1);
 	});
 
-	it("closes the browser when the result extraction throws", async () => {
+	it("isolates an extraction failure into a per-source warning and still closes the browser", async () => {
 		const { browser, page } = makeBrowser();
 		page.evaluate.mockRejectedValue(new Error("execution context destroyed"));
 		stubBrowser(browser);
-		await expect(ddgBrowserSearch(input, makeEnv())).rejects.toThrow(
-			"ddg-browser: search failed: execution context destroyed",
-		);
+		const outcome = await ddgBrowserSearch(input, makeEnv());
+		expect(outcome).toEqual({
+			results: {},
+			warnings: ["ddg-browser: web failed: execution context destroyed"],
+		});
 		expect(page.close).toHaveBeenCalled();
 		expect(browser.close).toHaveBeenCalled();
 	});
@@ -138,6 +181,7 @@ describe("ddgBrowserSearch", () => {
 		expect(url.searchParams.get("q")).toBe("firecrawl");
 		expect(url.searchParams.get("kl")).toBe("de-de");
 		expect(url.searchParams.get("df")).toBe("w");
+		expect(url.searchParams.get("kp")).toBe("-2");
 		expect(url.searchParams.get("iar")).toBe("news");
 		expect(url.searchParams.get("ia")).toBe("news");
 		expect(page.waitForSelector).toHaveBeenCalledWith("article", {
@@ -296,6 +340,10 @@ describe("ddgBrowserSearch", () => {
 		);
 		expect(getBrowser).toHaveBeenCalledTimes(1);
 		expect(browser.newPage).toHaveBeenCalledTimes(2);
+		// The empty-shell bug (SPA serves no results to the default headless
+		// UA) must stay pinned: every page gets the UA + viewport treatment.
+		expect(page.setUserAgent).toHaveBeenCalledTimes(2);
+		expect(page.setViewport).toHaveBeenCalledTimes(2);
 		expect(page.close).toHaveBeenCalledTimes(2);
 		expect(browser.close).toHaveBeenCalledTimes(1);
 		const webUrl = new URL(String(page.goto.mock.calls[0][0]));
@@ -305,6 +353,130 @@ describe("ddgBrowserSearch", () => {
 		expect(newsUrl.searchParams.get("ia")).toBe("news");
 		expect(outcome.results.web?.[0]?.url).toBe("https://a.com/1");
 		expect(outcome.results.news?.[0]?.url).toBe("https://news.example/story");
+		expect(outcome.warnings).toEqual([]);
+	});
+
+	it("returns web results with a news warning when only news fails", async () => {
+		const { browser, page } = makeBrowser();
+		stubBrowser(browser);
+		page.evaluate
+			.mockResolvedValueOnce([{ url: "https://a.com/1", title: "One" }])
+			.mockRejectedValueOnce(new Error("news boom"));
+		const outcome = await ddgBrowserSearch(
+			{ ...input, sources: ["web", "news"] },
+			makeEnv(),
+		);
+		expect(outcome.results.web?.[0]?.url).toBe("https://a.com/1");
+		expect(outcome.results.news).toBeUndefined();
+		expect(outcome.warnings).toEqual(["ddg-browser: news failed: news boom"]);
+		expect(page.close).toHaveBeenCalledTimes(2);
+		expect(browser.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns news results with a web warning when only web fails", async () => {
+		const { browser, page } = makeBrowser();
+		stubBrowser(browser);
+		page.evaluate
+			.mockRejectedValueOnce(new Error("web boom"))
+			.mockResolvedValueOnce([
+				{
+					url: "https://news.example/story",
+					title: "A Story",
+					snippet: "happened today",
+					timestamp: null,
+					image: null,
+				},
+			]);
+		const outcome = await ddgBrowserSearch(
+			{ ...input, sources: ["web", "news"] },
+			makeEnv(),
+		);
+		expect(outcome.results.web).toBeUndefined();
+		expect(outcome.results.news?.[0]?.url).toBe("https://news.example/story");
+		expect(outcome.warnings).toEqual(["ddg-browser: web failed: web boom"]);
+		expect(browser.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("warns for both sources and returns empty results when both fail", async () => {
+		const { browser, page } = makeBrowser();
+		stubBrowser(browser);
+		page.evaluate.mockRejectedValue(new Error("boom"));
+		const outcome = await ddgBrowserSearch(
+			{ ...input, sources: ["web", "news"] },
+			makeEnv(),
+		);
+		expect(outcome).toEqual({
+			results: {},
+			warnings: ["ddg-browser: web failed: boom", "ddg-browser: news failed: boom"],
+		});
+		expect(page.close).toHaveBeenCalledTimes(2);
+		expect(browser.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("runs the real news extraction callback against a stubbed DOM", async () => {
+		const { browser, page } = makeBrowser();
+		stubBrowser(browser);
+		evaluateInPage(page);
+		vi.stubGlobal("document", {
+			querySelectorAll: (selector: string) =>
+				selector === "article"
+					? [
+							fakeNewsArticle({
+								// Publisher/timestamp lines first — the title line sits
+								// in the middle, so removal must be line-based.
+								text: "Reuters\n41 Minutes ago\nBig Story\nSomething happened and then more of it",
+								anchors: [
+									{ href: "https://news.example/story", innerText: "Big Story" },
+									{ href: "https://news.example/ignored", innerText: "Ignored" },
+								],
+								image: { src: "https://news.example/story.jpg" },
+							}),
+							fakeNewsArticle({
+								text: "No anchor story\nSome text",
+							}),
+							fakeNewsArticle({
+								text: "Bad scheme\nSkipped",
+								anchors: [
+									{ href: "javascript:alert(1)", innerText: "Bad scheme" },
+								],
+							}),
+						]
+					: [],
+		});
+		const outcome = await ddgBrowserSearch(newsInput, makeEnv());
+		expect(outcome.results.news).toHaveLength(1);
+		const item = outcome.results.news?.[0];
+		// First anchor wins, its innerText is the title.
+		expect(item?.url).toBe("https://news.example/story");
+		expect(item?.title).toBe("Big Story");
+		// Title line removed wherever it sits; other lines preserved.
+		expect(item?.snippet).toBe(
+			"Reuters\n41 Minutes ago\nSomething happened and then more of it",
+		);
+		// Mixed-case "41 Minutes ago" matches via the serialized pattern's i flag.
+		expect(item?.imageUrl).toBe("https://news.example/story.jpg");
+		const age = Date.now() - new Date(item?.date ?? 0).getTime();
+		expect(age).toBeGreaterThanOrEqual(40 * 60_000);
+		expect(age).toBeLessThanOrEqual(42 * 60_000);
+		expect(outcome.warnings).toEqual([]);
+	});
+
+	it("runs the real web extraction callback against a stubbed DOM", async () => {
+		const { browser, page } = makeBrowser();
+		stubBrowser(browser);
+		evaluateInPage(page);
+		vi.stubGlobal("document", {
+			querySelectorAll: () => [
+				{ href: "https://a.com/1", innerText: "One" },
+				{ href: "javascript:alert(1)", innerText: "Bad scheme" },
+				{ href: "https://b.com/2", innerText: "Two" },
+			],
+		});
+		const outcome = await ddgBrowserSearch(input, makeEnv());
+		expect(outcome.results.web).toEqual([
+			{ url: "https://a.com/1", title: "One", description: "", position: 1 },
+			{ url: "https://b.com/2", title: "Two", description: "", position: 2 },
+		]);
 		expect(outcome.warnings).toEqual([]);
 	});
 
