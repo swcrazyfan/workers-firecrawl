@@ -8,8 +8,7 @@ import { WebSearch } from "./webSearch";
 export type Env = {
 	BROWSER: Fetcher;
 	AUTHORIZATION_KEY?: string;
-	SEARCH_PROVIDER?: string; // "searxng" | "ddg" | "browser"
-	SEARCH_FALLBACK?: string; // "ddg" | "browser" | "none"
+	SEARCH_CHAIN?: string; // comma-separated provider ids tried in order: "ddg" | "ddg-media" | "searxng" | "browser"
 	SEARXNG_ENDPOINT?: string;
 	SEARXNG_ENGINES?: string;
 	SEARXNG_HEADERS?: string; // JSON object of extra headers (CF Access etc.)
