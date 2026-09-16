@@ -38,9 +38,11 @@ docs/specs/              # per-task implementation specs (agents read these)
 
 ## Provider chains
 
-- **Search** (self-contained, NO SearXNG — decision reversed): DDG html fetch (primary)
-  → DDG via Browser Rendering (fallback, the proven current logic) → structured 503.
-  News/images via DDG's own news.js/i.js JSON endpoints (vqd token flow).
+- **Search** (self-contained by default; SearXNG optional, never required):
+  `SEARCH_CHAIN` = ordered provider list, resolved PER SOURCE (first success wins).
+  Providers: `ddg` (web, fetch), `ddg-media` (news/images, vqd JSON), `browser` (web,
+  Browser Rendering — the proven current logic), `searxng` (optional; all sources,
+  skipped unless SEARXNG_ENDPOINT is set). Default: `ddg,ddg-media,browser`.
 - **LLM**: OpenAI-compatible endpoint (GLM-5.3 Flash via `LLM_BASE_URL`, e.g. Z.ai or OpenRouter)
   preferred when a key is set; Cloudflare Workers AI (`env.AI`) as zero-config fallback.
   `LLM_STRICT_JSON=auto|on|off` (default `auto`): try native `json_schema`, fall back to
@@ -62,9 +64,9 @@ docs/specs/              # per-task implementation specs (agents read these)
 | 001 | ✅ Vendor v2 spec + drift CI (PR #1) | `spec/`, `scripts/`, `.github/workflows/spec-drift.yml` | — | 1 |
 | 004a | ✅ Fix base tsc errors + CI typecheck (PR #4) | `src/browser.ts`, `src/webSearch.ts`, `ci.yml` | — | 2 |
 | 002 | ✅ Search params (kl tables, tbs mappers) (PR #2) | `src/search/params.ts` + test | — | 1 |
-| 003 | ↩️ SearXNG provider — REMOVED by 005 (decision reversed: self-contained; PR #3 kept in history) | `src/search/types.ts`, `src/search/searxng.ts`, `Env` + tests | 002 (contract) | 1 |
+| 003 | ✅ SearXNG provider (PR #3) — retained as OPTIONAL backend, not in default chain | `src/search/types.ts`, `src/search/searxng.ts`, `Env` + tests | 002 (contract) | 1 |
 | 004 | ✅ DDG fetch provider (PR #5) | `src/search/ddg.ts` + fixtures/tests | 002 | 2 |
-| 005 | Provider chain (ddg→browser) + searxng removal | `src/search/provider.ts`, `src/search/ddgBrowser.ts`, deletes searxng | 004, 007 (contract) | 2 |
+| 005 | Configurable chain (SEARCH_CHAIN, per-source) | `src/search/provider.ts`, `src/search/ddgBrowser.ts` | 004, 007 (contract) | 2 |
 | 007 | DDG vqd media provider (news+images) | `src/search/ddgMedia.ts` + tests | 002 | 2 |
 | 006 | `/v2/search` route | `src/v2/search.ts`, `src/index.ts` | 005 | 2 |
 | 007 | `/v2/map` route | `src/v2/map.ts`, `src/crawler/sitemap.ts` | — | 3 |
