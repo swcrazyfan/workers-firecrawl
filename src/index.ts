@@ -2,6 +2,8 @@ import { fromHono } from "chanfana";
 import { type Context, Hono } from "hono";
 import { authorizationMiddleware } from "./authorization";
 import { WebScrape } from "./scrape";
+import { V2Crawl } from "./v2/crawl";
+import { V2CrawlStatus } from "./v2/crawlStatus";
 import { V2Map } from "./v2/map";
 import { V2Scrape } from "./v2/scrape";
 import { V2Search } from "./v2/search";
@@ -11,6 +13,8 @@ import { WebSearch } from "./webSearch";
 export type Env = {
 	BROWSER: Fetcher;
 	AUTHORIZATION_KEY?: string;
+	DB: D1Database; // crawl storage (D1)
+	CRAWL_WORKFLOW?: Workflow<{ jobId: string }>; // crawl engine, optional until task 012 lands
 	SEARCH_CHAIN?: string; // comma-separated provider ids tried in order: "ddg" | "ddg-media" | "searxng" | "browser"
 	SEARXNG_ENDPOINT?: string;
 	SEARXNG_ENGINES?: string;
@@ -42,6 +46,9 @@ openapi.post("/v1/scrape", WebScrape);
 openapi.post("/v2/map", V2Map);
 openapi.post("/v2/search", V2Search);
 openapi.post("/v2/scrape", V2Scrape);
+openapi.post("/v2/crawl", V2Crawl);
+openapi.get("/v2/crawl/:id", V2CrawlStatus);
+openapi.delete("/v2/crawl/:id", V2CrawlStatus);
 
 // Export the Hono app
 export default app;

@@ -2,3 +2,11 @@ name = "test"
 main = "index.ts"
 compatibility_date = "2025-01-28"
 compatibility_flags = ["nodejs_compat"]
+
+# Local, ephemeral D1 used by the test pool. Migrations are applied from
+# `migrations/` by `tests/setup.ts` via the `TEST_MIGRATIONS` binding wired in
+# `tests/vitest.config.ts`.
+[[d1_databases]]
+binding = "DB"
+database_name = "workers-firecrawl"
+database_id = "637dfc08-e6e8-490f-ba9c-8c452168709f"

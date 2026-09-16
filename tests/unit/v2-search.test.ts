@@ -61,7 +61,11 @@ vi.mock("../../src/webSearch", async () => {
 // it the same way as the v1 routes so importing src/index.ts stays browser-free.
 vi.mock("../../src/v2/scrape", async () => {
 	const { OpenAPIRoute } = await import("chanfana");
+	const { z } = await import("zod");
 	return {
+		// /v2/crawl reuses this union from the real module; the stub only needs a
+		// valid zod type so route registration does not blow up.
+		scrapeFormatSchema: z.unknown(),
 		V2Scrape: class extends OpenAPIRoute {
 			schema = {};
 			async handle() {
