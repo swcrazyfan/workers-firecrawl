@@ -61,6 +61,38 @@ const UNIMPLEMENTED_FORMATS = [
 const LEGACY_FULL_PAGE_WARNING =
 	"screenshot@fullPage is v1; use {type:'screenshot',fullPage:true}";
 
+// Single source of truth for the v2 scrape `formats` union. Exported so
+// /v2/crawl's `scrapeOptions.formats` validates against exactly the same
+// vocabulary instead of drifting.
+export const scrapeFormatSchema = z.union([
+	z.union([
+		z.enum(SUPPORTED_STRING_FORMATS),
+		z.enum(UNIMPLEMENTED_FORMATS),
+		// Legacy v1 alias: accepted and normalized to a full-page screenshot
+		// with a warning.
+		z.literal("screenshot@fullPage"),
+	]),
+	z.object({
+		type: z.literal("screenshot"),
+		fullPage: z.boolean().optional(),
+		quality: z.number().int().min(1).max(100).optional(),
+		viewport: z
+			.object({
+				width: z.number().int(),
+				height: z.number().int(),
+			})
+			.optional(),
+	}),
+	z.object({
+		type: z.literal("json"),
+		schema: z.unknown().optional(),
+		prompt: z.string().optional(),
+	}),
+	z.object({ type: z.literal("summary") }),
+	z.object({ type: z.enum(OBJECT_STRING_FORMATS) }),
+	z.object({ type: z.enum(UNIMPLEMENTED_FORMATS) }),
+]);
+
 export function normalizeFormats(input: unknown[]): NormalizedFormats {
 	const strings: string[] = [];
 	const warnings: string[] = [];
@@ -187,36 +219,7 @@ export class V2Scrape extends OpenAPIRoute {
 						schema: z.object({
 							url: z.string().url(),
 							formats: z
-								.array(
-									z.union([
-										z.union([
-											z.enum(SUPPORTED_STRING_FORMATS),
-											z.enum(UNIMPLEMENTED_FORMATS),
-											// Legacy v1 alias: accepted and normalized to a
-											// full-page screenshot with a warning.
-											z.literal("screenshot@fullPage"),
-										]),
-										z.object({
-											type: z.literal("screenshot"),
-											fullPage: z.boolean().optional(),
-											quality: z.number().int().min(1).max(100).optional(),
-											viewport: z
-												.object({
-													width: z.number().int(),
-													height: z.number().int(),
-												})
-												.optional(),
-										}),
-										z.object({
-											type: z.literal("json"),
-											schema: z.unknown().optional(),
-											prompt: z.string().optional(),
-										}),
-										z.object({ type: z.literal("summary") }),
-										z.object({ type: z.enum(OBJECT_STRING_FORMATS) }),
-										z.object({ type: z.enum(UNIMPLEMENTED_FORMATS) }),
-									]),
-								)
+								.array(scrapeFormatSchema)
 								.default(["markdown"])
 								.optional(),
 							onlyMainContent: z.boolean().default(true).optional(),
