@@ -37,7 +37,10 @@ export const scrapeActionSchema = z.union([
 	z.object({
 		type: z.literal("screenshot"),
 		fullPage: z.boolean().optional(),
-		quality: z.number().int().min(1).max(100).optional(),
+		// Unbounded on purpose: the vendored contract types quality as a plain
+		// integer (bounds are prose only). Invalid values fail at the browser
+		// layer like the real API, not with a 400 here.
+		quality: z.number().int().optional(),
 		viewport: z
 			.object({
 				width: z.number().int(),

@@ -22,7 +22,7 @@ Action objects, in execution order:
 | `write` | `text` (types into focused element — prior `click` focus is the caller's job, per contract) | implemented |
 | `press` | `key` | implemented |
 | `scroll` | `direction?: "up"\|"down"` (default `"down"`), `selector?` | implemented |
-| `screenshot` | `fullPage?: boolean`, `quality?: int 1..100`, `viewport?: {width,height}` | implemented → `data.actions.screenshots` |
+| `screenshot` | `fullPage?: boolean`, `quality?: int` (unbounded, per vendored contract), `viewport?: {width,height}` | implemented → `data.actions.screenshots` |
 | `pdf` | `format?/landscape?/scale?` | accepted-and-warn |
 | `executeJavascript` | `script` | accepted-and-warn |
 | `scrape` | — | accepted-and-warn |

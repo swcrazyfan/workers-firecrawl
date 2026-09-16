@@ -347,7 +347,6 @@ describe("scrapeActionSchema", () => {
 			{ type: "write" },
 			{ type: "press" },
 			{ type: "scroll", direction: "sideways" },
-			{ type: "screenshot", quality: 0 },
 			{ type: "screenshot", viewport: { width: 800 } },
 			{ type: "pdf", format: "Z9" },
 			{ type: "executeJavascript" },
