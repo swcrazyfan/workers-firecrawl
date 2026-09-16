@@ -2,6 +2,7 @@ import { fromHono } from "chanfana";
 import { type Context, Hono } from "hono";
 import { authorizationMiddleware } from "./authorization";
 import { WebScrape } from "./scrape";
+import { V2Scrape } from "./v2/scrape";
 import { V2Search } from "./v2/search";
 import { WebMap } from "./webMap";
 import { WebSearch } from "./webSearch";
@@ -28,6 +29,7 @@ openapi.post("/v1/search", WebSearch);
 openapi.post("/v1/map", WebMap);
 openapi.post("/v1/scrape", WebScrape);
 openapi.post("/v2/search", V2Search);
+openapi.post("/v2/scrape", V2Scrape);
 
 // Export the Hono app
 export default app;
