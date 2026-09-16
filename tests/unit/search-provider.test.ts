@@ -408,12 +408,47 @@ describe("searchWithFallback", () => {
 		).rejects.toThrow("search backend unavailable: ddg-media: vqd quota hit");
 	});
 
+	it("falls back to the browser for news when ddg-media fails on the default chain", async () => {
+		const env = makeEnv();
+		const input: SearchInput = { ...baseInput, sources: ["news"] };
+		vi.mocked(ddgMediaSearch).mockRejectedValue(
+			new Error("ddg-media: 403 throttled"),
+		);
+		vi.mocked(ddgBrowserSearch).mockResolvedValue(newsOutcome());
+		const outcome = await searchWithFallback(input, env);
+		expect(ddgWebSearch).not.toHaveBeenCalled();
+		expect(ddgMediaSearch).toHaveBeenCalledTimes(1);
+		expect(ddgBrowserSearch).toHaveBeenCalledTimes(1);
+		expect(ddgBrowserSearch).toHaveBeenCalledWith(
+			{ ...input, sources: ["news"] },
+			env,
+		);
+		expect(outcome.results.news?.[0]?.url).toBe("https://news.example/story");
+		expect(outcome.warnings).toContain("ddg-media: 403 throttled");
+	});
+
+	it("serves news from the browser alone when SEARCH_CHAIN=browser", async () => {
+		const env = makeEnv({ SEARCH_CHAIN: "browser" });
+		const input: SearchInput = { ...baseInput, sources: ["news"] };
+		vi.mocked(ddgBrowserSearch).mockResolvedValue(newsOutcome());
+		const outcome = await searchWithFallback(input, env);
+		expect(ddgWebSearch).not.toHaveBeenCalled();
+		expect(ddgMediaSearch).not.toHaveBeenCalled();
+		expect(ddgBrowserSearch).toHaveBeenCalledTimes(1);
+		expect(ddgBrowserSearch).toHaveBeenCalledWith(
+			{ ...input, sources: ["news"] },
+			env,
+		);
+		expect(outcome.results.news).toHaveLength(1);
+		expect(outcome.warnings).toEqual([]);
+	});
+
 	it("explains when no chained provider can serve a source", async () => {
 		const env = makeEnv({ SEARCH_CHAIN: "ddg,browser" });
 		await expect(
-			searchWithFallback({ ...baseInput, sources: ["news"] }, env),
+			searchWithFallback({ ...baseInput, sources: ["images"] }, env),
 		).rejects.toThrow(
-			"search backend unavailable: no provider available for news",
+			"search backend unavailable: no provider available for images",
 		);
 		expect(ddgWebSearch).not.toHaveBeenCalled();
 		expect(ddgBrowserSearch).not.toHaveBeenCalled();
