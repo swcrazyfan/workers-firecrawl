@@ -17,7 +17,7 @@ const PROVIDER_CAPABILITIES: Record<string, Source[]> = {
 	ddg: ["web"],
 	"ddg-media": ["news", "images"],
 	searxng: ["web", "news", "images"],
-	browser: ["web"],
+	browser: ["web", "news"],
 };
 
 const DEFAULT_SEARCH_CHAIN = ["ddg", "ddg-media", "browser"];
