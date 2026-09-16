@@ -19,6 +19,13 @@ export interface RobotsRules {
 	crawlDelaySec?: number;
 }
 
+// Default product token/UA used when fetching robots.txt and scraping. Sites
+// commonly write `User-agent: workers-firecrawl` (the product token) while the
+// request UA carries a version/comment, so group matching accepts either the
+// full UA or its leading product token (see `matchesAgent`).
+export const CRAWL_USER_AGENT =
+	"workers-firecrawl/1.0 (+https://github.com/swcrazyfan/workers-firecrawl)";
+
 interface RobotsGroup {
 	agents: string[];
 	allow: string[];
@@ -31,6 +38,14 @@ const ROBOTS_TIMEOUT_MS = 5000;
 function stripComment(line: string): string {
 	const hash = line.indexOf("#");
 	return hash === -1 ? line : line.slice(0, hash);
+}
+
+// A robots group agent matches when it equals our UA or its product token
+// (`workers-firecrawl/1.0 (...) -> workers-firecrawl`).
+function matchesAgent(agent: string, wanted: string): boolean {
+	if (agent === wanted) return true;
+	const token = wanted.split(/[\s/]/)[0] ?? "";
+	return token !== "" && agent === token;
 }
 
 export function parseRobotsTxt(text: string, userAgent?: string): RobotsRules {
@@ -75,10 +90,14 @@ export function parseRobotsTxt(text: string, userAgent?: string): RobotsRules {
 	const wanted = (userAgent ?? "").trim().toLowerCase();
 	const exact = wanted
 		? groups.find((group) =>
-				group.agents.some((agent) => agent !== "*" && agent === wanted),
+				group.agents.some(
+					(agent) => agent !== "*" && matchesAgent(agent, wanted),
+				),
 			)
 		: undefined;
 	const wildcard = groups.find((group) => group.agents.includes("*"));
+	// Standard behaviour when nothing matches (a named-URL site with neither our
+	// UA nor `*`): allow everything. Documented deliberate choice, not a bug.
 	const chosen = exact ?? wildcard;
 
 	if (!chosen) return { allow: [], disallow: [] };

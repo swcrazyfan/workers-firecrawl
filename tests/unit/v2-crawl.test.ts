@@ -185,6 +185,38 @@ describe("POST /v2/crawl", () => {
 		});
 	});
 
+	it("does not enqueue or count the seed for sitemap:only", async () => {
+		const res = await postCrawl(
+			{ url: SEED, sitemap: "only" },
+			makeEnv(workflowMock()),
+		);
+		expect(res.status).toBe(200);
+		const body = await res.json();
+
+		const count = await env.DB.prepare(
+			"SELECT COUNT(*) AS count FROM crawl_queue WHERE job_id = ?",
+		)
+			.bind(body.id)
+			.first<{ count: number }>();
+		expect(count.count).toBe(0);
+		expect((await getJob(env.DB, body.id))?.total).toBe(0);
+	});
+
+	it("counts the seed toward the job total", async () => {
+		const res = await postCrawl({ url: SEED }, makeEnv(workflowMock()));
+		const body = await res.json();
+		expect((await getJob(env.DB, body.id))?.total).toBe(1);
+	});
+
+	it("accepts robotsUserAgent without warning", async () => {
+		const res = await postCrawl(
+			{ url: SEED, robotsUserAgent: "mybot" },
+			makeEnv(workflowMock()),
+		);
+		expect(res.status).toBe(200);
+		expect((await res.json()).warning).toBeUndefined();
+	});
+
 	it("accepts scrapeOptions formats using the v2 scrape union", async () => {
 		const res = await postCrawl(
 			{

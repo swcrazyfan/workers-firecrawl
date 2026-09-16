@@ -25,15 +25,22 @@ import { extractContent, getBrowser } from "../../src/browser";
 import {
 	type CrawlBatch,
 	type CrawlOptions,
+	ROBOTS_DISALLOWED,
+	buildTerminalPayload,
+	decideTerminalStatus,
 	filterDiscoveredLinks,
+	finalizeCrawl,
 	initializeCrawl,
 	isTerminal,
 	loadCrawlOptions,
 	parseCrawlOptions,
+	postWebhook,
 	processCrawlBatch,
+	runCrawlBatch,
 } from "../../src/crawler/engine";
-import { fetchRobots } from "../../src/crawler/robots";
+import { CRAWL_USER_AGENT, fetchRobots } from "../../src/crawler/robots";
 import {
+	bumpJobCounters,
 	claimNextBatch,
 	createJob,
 	enqueueUrls,
@@ -82,7 +89,7 @@ function scrapeFor(url: string) {
 	};
 }
 
-async function makeJob(id: string, urls: CrawlBatch[]) {
+async function enqueueJob(id: string, urls: CrawlBatch[]) {
 	await createJob(testEnv.DB, {
 		id,
 		url: urls[0]?.url ?? BASE,
@@ -91,6 +98,10 @@ async function makeJob(id: string, urls: CrawlBatch[]) {
 		expiresAt: NOW + 600_000,
 	});
 	await enqueueUrls(testEnv.DB, id, urls, NOW);
+}
+
+async function makeJob(id: string, urls: CrawlBatch[]) {
+	await enqueueJob(id, urls);
 	return await claimNextBatch(testEnv.DB, id, 10);
 }
 
@@ -101,6 +112,19 @@ async function queueRows(jobId: string) {
 		.bind(jobId)
 		.all<{ url: string; status: string }>();
 	return results;
+}
+
+// Minimal D1 stand-in that forwards to the real test database but throws from
+// `prepare` for statements matching `match`, simulating a mid-batch failure.
+function failingDb(match: (sql: string) => boolean): D1Database {
+	const real = testEnv.DB;
+	return {
+		prepare: (sql: string) => {
+			if (match(sql)) throw new Error("d1 unavailable");
+			return real.prepare(sql);
+		},
+		batch: (statements: D1PreparedStatement[]) => real.batch(statements),
+	} as unknown as D1Database;
 }
 
 function stubSitemap(urls: string[]) {
@@ -301,6 +325,7 @@ describe("parseCrawlOptions", () => {
 			ignoreRobotsTxt: true,
 			sitemap: "only",
 			includePaths: ["/blog/*"],
+			robotsUserAgent: "mybot",
 			scrapeOptions: { formats: [{ type: "json", prompt: "price" }, "markdown"] },
 			webhook: {
 				url: "https://hooks.example.com/crawl",
@@ -317,10 +342,21 @@ describe("parseCrawlOptions", () => {
 			sitemap: "only",
 			includePaths: ["/blog/*"],
 			excludePaths: [],
+			robotsUserAgent: "mybot",
+			summaryRequested: false,
 		});
 		expect(parsed.scrapeFormats).toEqual(["markdown"]);
 		expect(parsed.jsonFormat).toMatchObject({ prompt: "price" });
 		expect(parsed.webhook?.url).toBe("https://hooks.example.com/crawl");
+	});
+
+	it("flags a requested summary that crawl cannot produce", () => {
+		const parsed = parseCrawlOptions({
+			scrapeOptions: { formats: ["markdown", { type: "summary" }] },
+		});
+
+		expect(parsed.summaryRequested).toBe(true);
+		expect(parsed.scrapeFormats).toEqual(["markdown"]);
 	});
 
 	it("falls back to defaults for an empty options blob", () => {
@@ -335,6 +371,7 @@ describe("parseCrawlOptions", () => {
 			sitemap: "include",
 			scrapeFormats: ["markdown"],
 			jsonFormat: null,
+			robotsUserAgent: undefined,
 			webhook: null,
 		});
 	});
@@ -469,6 +506,62 @@ describe("initializeCrawl", () => {
 	});
 });
 
+describe("sitemap:only end-to-end", () => {
+	it("never enqueues or crawls the seed, only sitemap urls", async () => {
+		vi.mocked(fetchRobots).mockResolvedValue(null);
+		stubSitemap(["https://example.com/from-sitemap"]);
+		// Replicates the endpoint path: the seed is not enqueued for `only`.
+		await createJob(testEnv.DB, {
+			id: "job-only-e2e",
+			url: BASE,
+			options: { sitemap: "only" },
+			now: NOW,
+			expiresAt: NOW + 1000,
+		});
+
+		await initializeCrawl(env, "job-only-e2e", BASE, opts({ sitemap: "only" }));
+		const result = await runCrawlBatch(
+			env,
+			"job-only-e2e",
+			opts({ sitemap: "only" }),
+			5,
+		);
+
+		expect(result.completed).toBe(1);
+		// The seed was never scraped; only the sitemap URL produced a result.
+		expect(vi.mocked(extractContent).mock.calls.map((call) => call[1])).toEqual([
+			"https://example.com/from-sitemap",
+		]);
+		expect(
+			(await listResults(testEnv.DB, "job-only-e2e", { limit: 10 })).map(
+				(row) => row.url,
+			),
+		).toEqual(["https://example.com/from-sitemap"]);
+		expect((await queueRows("job-only-e2e")).some((row) => row.url === BASE)).toBe(
+			false,
+		);
+	});
+
+	it("skips a pre-existing seed row under sitemap:only", async () => {
+		const batch = await makeJob("job-only-legacy", [
+			{ url: BASE, depth: 0 },
+			{ url: "https://example.com/from-sitemap", depth: 0 },
+		]);
+
+		const result = await processCrawlBatch(
+			env,
+			"job-only-legacy",
+			batch,
+			opts({ sitemap: "only" }),
+		);
+
+		expect(result.completed).toBe(1);
+		expect(vi.mocked(extractContent).mock.calls.map((call) => call[1])).toEqual([
+			"https://example.com/from-sitemap",
+		]);
+	});
+});
+
 describe("processCrawlBatch", () => {
 	it("inserts results, bumps counters and enqueues discoveries", async () => {
 		const batch = await makeJob("job-happy", [
@@ -478,7 +571,7 @@ describe("processCrawlBatch", () => {
 
 		const result = await processCrawlBatch(env, "job-happy", batch, opts());
 
-		expect(result).toEqual({ completed: 2, failed: 0, discovered: 2 });
+		expect(result).toMatchObject({ completed: 2, failed: 0, discovered: 2 });
 
 		const rows = await listResults(testEnv.DB, "job-happy", { limit: 10 });
 		expect(rows.map((row) => row.url)).toEqual([
@@ -528,7 +621,7 @@ describe("processCrawlBatch", () => {
 		expect((await getJob(testEnv.DB, "job-fail"))?.completed).toBe(1);
 	});
 
-	it("fails robots-disallowed urls without scraping them", async () => {
+	it("records a failed result with the robots reason and does not scrape", async () => {
 		vi.mocked(fetchRobots).mockResolvedValue({
 			allow: [],
 			disallow: ["/blocked"],
@@ -555,6 +648,69 @@ describe("processCrawlBatch", () => {
 		expect(
 			queue.find((row) => row.url === "https://example.com/blocked")?.status,
 		).toBe("failed");
+
+		const rows = await listResults(testEnv.DB, "job-robots", { limit: 10 });
+		const blocked = rows.find((row) => row.url === "https://example.com/blocked");
+		expect(blocked?.status).toBe("failed");
+		expect(blocked?.error).toBe(ROBOTS_DISALLOWED);
+	});
+
+	it("fetches robots and scrapes with the default crawl user agent", async () => {
+		vi.mocked(fetchRobots).mockResolvedValue(null);
+		const batch = await makeJob("job-ua", [
+			{ url: "https://example.com/a", depth: 0 },
+		]);
+
+		await processCrawlBatch(
+			env,
+			"job-ua",
+			batch,
+			opts({ ignoreRobotsTxt: false }),
+		);
+
+		expect(fetchRobots).toHaveBeenCalledWith(
+			"https://example.com/a",
+			CRAWL_USER_AGENT,
+		);
+		const call = vi.mocked(extractContent).mock.calls[0];
+		const extractOpts = call[2] as { headers?: Record<string, string> };
+		expect(extractOpts.headers?.["User-Agent"]).toBe(CRAWL_USER_AGENT);
+	});
+
+	it("honours a robotsUserAgent override", async () => {
+		vi.mocked(fetchRobots).mockResolvedValue(null);
+		const batch = await makeJob("job-ua-override", [
+			{ url: "https://example.com/a", depth: 0 },
+		]);
+
+		await processCrawlBatch(
+			env,
+			"job-ua-override",
+			batch,
+			opts({ ignoreRobotsTxt: false, robotsUserAgent: "mybot" }),
+		);
+
+		expect(fetchRobots).toHaveBeenCalledWith("https://example.com/a", "mybot");
+	});
+
+	it("reports the robots crawl-delay so the workflow can pace", async () => {
+		vi.mocked(fetchRobots).mockResolvedValue({
+			allow: [],
+			disallow: [],
+			crawlDelaySec: 3,
+		});
+		const batch = await makeJob("job-delay", [
+			{ url: "https://example.com/a", depth: 0 },
+		]);
+
+		const result = await processCrawlBatch(
+			env,
+			"job-delay",
+			batch,
+			opts({ ignoreRobotsTxt: false }),
+		);
+
+		expect(result.crawlDelaySec).toBe(3);
 	});
 
 	it("degrades an AI json failure to a stored warning", async () => {
@@ -586,6 +742,25 @@ describe("processCrawlBatch", () => {
 			}),
 			env,
 		);
+	});
+
+	it("warns when a requested summary is not produced", async () => {
+		const batch = await makeJob("job-summary", [
+			{ url: "https://example.com/a", depth: 0 },
+		]);
+
+		const result = await processCrawlBatch(
+			env,
+			"job-summary",
+			batch,
+			opts({ summaryRequested: true }),
+		);
+
+		expect(result.completed).toBe(1);
+		const rows = await listResults(testEnv.DB, "job-summary", { limit: 10 });
+		expect(rows[0].metadata).toMatchObject({
+			warning: expect.stringContaining("summary"),
+		});
 	});
 
 	it("does not enqueue discoveries in sitemap:only", async () => {
@@ -637,6 +812,189 @@ describe("processCrawlBatch", () => {
 
 		expect(result.failed).toBe(1);
 		expect(browserClose).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("runCrawlBatch", () => {
+	it("releases claimed rows when it throws, so a retry processes them", async () => {
+		await enqueueJob("job-retry", [
+			{ url: "https://example.com/a", depth: 0 },
+		]);
+		const broken = {
+			DB: failingDb((sql) => sql.includes("INSERT INTO crawl_results")),
+		} as unknown as Env;
+
+		await expect(runCrawlBatch(broken, "job-retry", opts(), 5)).rejects.toThrow(
+			"d1 unavailable",
+		);
+		expect((await queueRows("job-retry"))[0].status).toBe("pending");
+
+		const retry = await runCrawlBatch(env, "job-retry", opts(), 5);
+		expect(retry.completed).toBe(1);
+		expect(
+			(await listResults(testEnv.DB, "job-retry", { limit: 10 })).map(
+				(row) => row.url,
+			),
+		).toEqual(["https://example.com/a"]);
+	});
+
+	it("enforces limit within a batch and leaves the remainder pending", async () => {
+		await enqueueJob(
+			"job-limit",
+			[1, 2, 3, 4, 5].map((n) => ({
+				url: `https://example.com/${n}`,
+				depth: 0,
+			})),
+		);
+
+		const result = await runCrawlBatch(
+			env,
+			"job-limit",
+			opts({ limit: 2, maxDiscoveryDepth: 0 }),
+			5,
+		);
+
+		expect(result.completed).toBe(2);
+		expect(await listResults(testEnv.DB, "job-limit", { limit: 10 })).toHaveLength(
+			2,
+		);
+		const queue = await queueRows("job-limit");
+		expect(queue.filter((row) => row.status === "pending")).toHaveLength(3);
+	});
+
+	it("caches robots per batch and refetches for the next batch", async () => {
+		vi.mocked(fetchRobots).mockResolvedValue({ allow: [], disallow: [] });
+		await enqueueJob("job-cache", [
+			{ url: "https://example.com/a", depth: 0 },
+			{ url: "https://example.com/b", depth: 0 },
+		]);
+
+		await runCrawlBatch(env, "job-cache", opts({ ignoreRobotsTxt: false }), 2);
+		expect(fetchRobots).toHaveBeenCalledTimes(1);
+
+		vi.mocked(fetchRobots).mockClear();
+		await runCrawlBatch(env, "job-cache", opts({ ignoreRobotsTxt: false }), 2);
+		expect(fetchRobots).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("finalizeCrawl", () => {
+	it("never overwrites a cancelled job", async () => {
+		await createJob(testEnv.DB, {
+			id: "job-finalize-cancel",
+			url: BASE,
+			options: {},
+			now: NOW,
+			expiresAt: NOW + 1000,
+		});
+		await setJobStatus(testEnv.DB, "job-finalize-cancel", "cancelled", {
+			completedAt: NOW,
+		});
+
+		const status = await finalizeCrawl(env, "job-finalize-cancel", 1, 0);
+
+		expect(status).toBe("cancelled");
+		expect((await getJob(testEnv.DB, "job-finalize-cancel"))?.status).toBe(
+			"cancelled",
+		);
+	});
+
+	it("finalizes a scraping job from the run counters", async () => {
+		await createJob(testEnv.DB, {
+			id: "job-finalize-allfail",
+			url: BASE,
+			options: {},
+			now: NOW,
+			expiresAt: NOW + 1000,
+		});
+		expect(await finalizeCrawl(env, "job-finalize-allfail", 3, 0)).toBe("failed");
+
+		await createJob(testEnv.DB, {
+			id: "job-finalize-ok",
+			url: BASE,
+			options: {},
+			now: NOW,
+			expiresAt: NOW + 1000,
+		});
+		expect(await finalizeCrawl(env, "job-finalize-ok", 0, 0)).toBe("completed");
+	});
+});
+
+describe("decideTerminalStatus", () => {
+	it("keeps explicit terminal statuses and derives failed/completed", () => {
+		expect(decideTerminalStatus(3, 0, "scraping")).toBe("failed");
+		expect(decideTerminalStatus(3, 1, "scraping")).toBe("completed");
+		expect(decideTerminalStatus(0, 0, "scraping")).toBe("completed");
+		expect(decideTerminalStatus(3, 3, "cancelled")).toBe("cancelled");
+		expect(decideTerminalStatus(3, 0, "failed")).toBe("failed");
+	});
+});
+
+describe("webhook", () => {
+	it("builds a typed payload and honours the events filter", async () => {
+		await createJob(testEnv.DB, {
+			id: "job-hook",
+			url: BASE,
+			options: {},
+			now: NOW,
+			expiresAt: NOW + 1000,
+		});
+		await setJobStatus(testEnv.DB, "job-hook", "failed", { completedAt: NOW });
+
+		const payload = await buildTerminalPayload(env, "job-hook", "crawl.failed", {
+			tenant: "acme",
+		});
+		expect(payload.type).toBe("crawl.failed");
+		expect(payload.status).toBe("failed");
+		expect(payload.metadata).toEqual({ tenant: "acme" });
+
+		const fetchMock = vi.fn(async () => new Response("ok"));
+		vi.stubGlobal("fetch", fetchMock);
+
+		const filtered = await postWebhook(
+			{ url: "https://hooks.example.com/x", events: ["completed"] },
+			payload,
+		);
+		expect(filtered).toBe(false);
+		expect(fetchMock).not.toHaveBeenCalled();
+
+		const sent = await postWebhook(
+			{ url: "https://hooks.example.com/x" },
+			payload,
+		);
+		expect(sent).toBe(true);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("total accounting", () => {
+	it("counts the seed in total so total === completed after a crawl", async () => {
+		vi.mocked(fetchRobots).mockResolvedValue(null);
+		// Replicates the endpoint path: the seed is enqueued and counted at
+		// creation time, before the workflow runs.
+		await createJob(testEnv.DB, {
+			id: "job-total",
+			url: BASE,
+			options: { sitemap: "skip" },
+			now: NOW,
+			expiresAt: NOW + 1000,
+		});
+		const seeded = await enqueueUrls(
+			testEnv.DB,
+			"job-total",
+			[{ url: BASE, depth: 0 }],
+			NOW,
+		);
+		await bumpJobCounters(testEnv.DB, "job-total", { total: seeded, now: NOW });
+
+		const runOpts = opts({ sitemap: "skip", maxDiscoveryDepth: 0 });
+		await initializeCrawl(env, "job-total", BASE, runOpts);
+		const result = await runCrawlBatch(env, "job-total", runOpts, 5);
+
+		expect(result.completed).toBe(1);
+		const job = await getJob(testEnv.DB, "job-total");
+		expect(job?.total).toBe(1);
+		expect(job?.completed).toBe(1);
 	});
 });
 

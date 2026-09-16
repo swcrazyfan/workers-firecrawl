@@ -7,15 +7,20 @@ import {
 import type { Env } from "../index";
 import {
 	buildTerminalPayload,
+	finalizeCrawl,
 	initializeCrawl,
-	isTerminal,
 	loadCrawlOptions,
 	postWebhook,
-	processCrawlBatch,
+	runCrawlBatch,
 } from "./engine";
-import { claimNextBatch, getJob, setJobStatus } from "./store";
+import { getJob, setJobStatus } from "./store";
 
 const BATCH_SIZE = 5;
+// Politeness cap for a robots `Crawl-delay`; the between-batch sleep is never
+// shorter than 1s or longer than this.
+const MIN_PACE_SECONDS = 1;
+const MAX_PACE_SECONDS = 10;
+
 const STEP_RETRIES: NonNullable<WorkflowStepConfig["retries"]> = {
 	limit: 2,
 	delay: "5 seconds",
@@ -24,7 +29,8 @@ const STEP_RETRIES: NonNullable<WorkflowStepConfig["retries"]> = {
 
 // Thin orchestration only: every step delegates to the testable engine. The
 // Workflow runtime persists each step result, so a retried run resumes after the
-// last completed step instead of re-crawling.
+// last completed step instead of re-crawling (and `runCrawlBatch` releases any
+// rows a failed attempt had claimed).
 export class CrawlWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
 	async run(
 		event: WorkflowEvent<{ jobId: string }>,
@@ -45,71 +51,60 @@ export class CrawlWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
 			return;
 		}
 
+		// 10 minutes covers the bounded sitemap fetch worst case
+		// (20 files * 5s + robots), see `initializeCrawl`.
 		await step.do(
 			"initialize",
-			{ retries: STEP_RETRIES, timeout: "2 minutes" },
+			{ retries: STEP_RETRIES, timeout: "10 minutes" },
 			async () => await initializeCrawl(this.env, jobId, job.url, opts),
 		);
 
 		let succeeded = 0;
 		let attempted = 0;
+		let lastDelaySec = 0;
 
 		for (let n = 1; ; n++) {
 			const result = await step.do(
 				`batch ${n}`,
 				{ retries: STEP_RETRIES, timeout: "10 minutes" },
-				async () => {
-					const batch = await claimNextBatch(db, jobId, BATCH_SIZE);
-					if (batch.length === 0) {
-						return {
-							empty: true,
-							terminal: false,
-							completed: 0,
-							failed: 0,
-							discovered: 0,
-						};
-					}
-					const counts = await processCrawlBatch(this.env, jobId, batch, opts);
-					const current = await getJob(db, jobId);
-					return {
-						empty: false,
-						terminal: current ? isTerminal(current.status) : true,
-						...counts,
-					};
-				},
+				async () => await runCrawlBatch(this.env, jobId, opts, BATCH_SIZE),
 			);
 
+			// Count the final batch before any break so nothing is discarded.
+			if (!result.empty) {
+				succeeded += result.completed;
+				attempted += result.completed + result.failed;
+				lastDelaySec = result.crawlDelaySec ?? 0;
+			}
+
 			if (result.empty || result.terminal) break;
-
-			succeeded += result.completed;
-			attempted += result.completed + result.failed;
-
-			// `limit` caps successfully crawled pages; the queue bounds the rest.
 			if (succeeded >= opts.limit) break;
 
-			await step.sleep(`pace ${n}`, "1 second");
+			const pace = Math.min(
+				Math.max(lastDelaySec, MIN_PACE_SECONDS),
+				MAX_PACE_SECONDS,
+			);
+			await step.sleep(`pace ${n}`, pace * 1000);
 		}
 
-		const status =
-			attempted > 0 && succeeded === 0
-				? ("failed" as const)
-				: ("completed" as const);
-
-		await step.do(
+		const status = await step.do(
 			"finalize",
 			{ retries: STEP_RETRIES, timeout: "1 minute" },
-			async () => {
-				await setJobStatus(db, jobId, status, { completedAt: Date.now() });
-			},
+			async () => await finalizeCrawl(this.env, jobId, attempted, succeeded),
 		);
 
 		const webhook = opts.webhook;
-		if (webhook) {
+		if (webhook && (status === "completed" || status === "failed")) {
 			await step.do(
 				"webhook",
 				{ retries: { limit: 0, delay: "1 second" }, timeout: "30 seconds" },
 				async () => {
-					const payload = await buildTerminalPayload(this.env, jobId, status);
+					const payload = await buildTerminalPayload(
+						this.env,
+						jobId,
+						status === "failed" ? "crawl.failed" : "crawl.completed",
+						webhook.metadata,
+					);
 					await postWebhook(webhook, payload);
 				},
 			);

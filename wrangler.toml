@@ -16,6 +16,14 @@ binding = "DB"
 database_name = "workers-firecrawl"
 database_id = "637dfc08-e6e8-490f-ba9c-8c452168709f"
 
+# Cloudflare Workflows step ceiling: Free accounts allow 1024 steps, Workers
+# Paid defaults to 10_000 and can be raised to 25_000 via [workflows.limits].
+# The engine runs one `initialize` + one `finalize` + one `webhook` step plus
+# `ceil(limit / 5)` batch steps (batch size 5), i.e. roughly `limit / 5 + 3`.
+# A `limit` above ~5000 on Free, or above ~125_000 on Paid, would need
+# `[workflows.limits].steps` raised (Workers Paid only):
+# [workflows.limits]
+# steps = 25_000
 [[workflows]]
 name = "workers-firecrawl-crawl"
 binding = "CRAWL_WORKFLOW"

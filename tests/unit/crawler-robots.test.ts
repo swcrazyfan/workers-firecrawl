@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	CRAWL_USER_AGENT,
 	type RobotsRules,
 	fetchRobots,
 	isPathAllowed,
@@ -68,6 +69,27 @@ describe("parseRobotsTxt", () => {
 		expect(parsed.disallow).toEqual(["/private"]);
 		expect(parsed.allow).toEqual([]);
 		expect(parsed.crawlDelaySec).toBe(2.5);
+	});
+
+	it("matches a named group by our product token instead of failing open", () => {
+		const text = "User-agent: workers-firecrawl\nDisallow: /private\n";
+
+		// The default UA carries a version/comment; the product token must match.
+		expect(parseRobotsTxt(text, CRAWL_USER_AGENT).disallow).toEqual([
+			"/private",
+		]);
+		// Without a UA the named group is skipped: this is the documented
+		// fail-open fallback that passing the UA fixes.
+		expect(parseRobotsTxt(text)).toEqual({ allow: [], disallow: [] });
+	});
+
+	it("allows everything when neither our group nor a wildcard exists", () => {
+		expect(
+			parseRobotsTxt(
+				"User-agent: Googlebot\nDisallow: /\n",
+				CRAWL_USER_AGENT,
+			),
+		).toEqual({ allow: [], disallow: [] });
 	});
 
 	it("returns empty rules when nothing matches", () => {

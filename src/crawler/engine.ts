@@ -9,15 +9,24 @@
 import { extractStructured } from "../ai/extract";
 import type { Env } from "../index";
 import { normalizeFormats } from "../v2/scrape";
-import { type RobotsRules, fetchRobots, isPathAllowed } from "./robots";
+import {
+	CRAWL_USER_AGENT,
+	type RobotsRules,
+	fetchRobots,
+	isPathAllowed,
+} from "./robots";
 import { fetchSitemapUrls } from "./sitemap";
 import {
+	type CrawlStatus,
 	bumpJobCounters,
+	claimNextBatch,
 	enqueueUrls,
 	getJob,
 	insertResult,
 	listResults,
 	markQueueItem,
+	resetQueueItems,
+	setJobStatus,
 } from "./store";
 
 export interface CrawlOptions {
@@ -31,6 +40,11 @@ export interface CrawlOptions {
 	sitemap: "skip" | "include" | "only";
 	scrapeFormats: string[];
 	jsonFormat?: { schema?: unknown; prompt?: string } | null;
+	// Optional robots UA override (persisted `robotsUserAgent`).
+	robotsUserAgent?: string;
+	// Set when the request asked for `summary`; crawl does not implement it, so
+	// every result carries an explanatory metadata warning instead.
+	summaryRequested?: boolean;
 }
 
 export interface StoredWebhook {
@@ -44,13 +58,16 @@ export interface StoredCrawlOptions extends CrawlOptions {
 	webhook?: StoredWebhook | null;
 }
 
+export type WebhookType = "crawl.completed" | "crawl.failed";
+
 export interface TerminalPayload {
-	type: "crawl.completed";
+	type: WebhookType;
 	id: string;
 	status: string;
 	total: number;
 	completed: number;
 	data: Array<Record<string, unknown>>;
+	metadata?: Record<string, unknown>;
 }
 
 export interface CrawlBatch {
@@ -63,6 +80,14 @@ export interface CrawlBatchResult {
 	completed: number;
 	failed: number;
 	discovered: number;
+	// Longest `Crawl-delay` seen in this batch's robots rules (seconds), so the
+	// Workflow can pace itself politely.
+	crawlDelaySec?: number;
+}
+
+export interface CrawlRunResult extends CrawlBatchResult {
+	empty: boolean;
+	terminal: boolean;
 }
 
 // Imported lazily inside `processCrawlBatch`: exporting `CrawlWorkflow` from
@@ -77,6 +102,15 @@ const DEFAULT_LIMIT = 10000;
 const DEFAULT_MAX_DISCOVERY_DEPTH = 10;
 const SCRAPE_TIMEOUT_MS = 60000;
 const TERMINAL_PAGE_SIZE = 50;
+// Sitemap fetch bounds. Worst case is `SITEMAP_MAX_FILES * SITEMAP_TIMEOUT_MS`
+// plus one robots discovery fetch: 20 * 5s + 5s = 105s, comfortably inside the
+// initialize step's 10 minute timeout even if every file times out.
+const SITEMAP_MAX_FILES = 20;
+const SITEMAP_TIMEOUT_MS = 5000;
+
+export const ROBOTS_DISALLOWED = "robots.txt disallowed";
+const SUMMARY_UNSUPPORTED =
+	"summary format is not supported by crawl and was ignored";
 
 const ASSET_EXTENSIONS = new Set([
 	"png",
@@ -104,13 +138,16 @@ const ASSET_EXTENSIONS = new Set([
 
 const NON_HTTP_SCHEME = /^(mailto|tel|javascript|data|sms|ftp):/i;
 
-// Robots rules are fetched at most once per origin per batch. The map is
-// module-level so concurrent items in the same batch share it, and is reset at
-// the start of every batch so a long-lived isolate never serves stale rules.
-let robotsCache = new Map<string, RobotsRules | null>();
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeUrl(url: string): string {
+	try {
+		return new URL(url).toString();
+	} catch {
+		return url;
+	}
 }
 
 function isInternalHost(
@@ -221,16 +258,28 @@ function ensureLinks(formats: string[]): string[] {
 	return formats.includes("links") ? formats : [...formats, "links"];
 }
 
-async function robotsForOrigin(url: string): Promise<RobotsRules | null> {
+function crawlUserAgent(opts: CrawlOptions): string {
+	const override = opts.robotsUserAgent?.trim();
+	return override && override !== "" ? override : CRAWL_USER_AGENT;
+}
+
+// Robots rules are fetched at most once per origin per batch. The cache is
+// created per `processCrawlBatch` call, so concurrent batches on the same
+// isolate cannot clobber each other.
+async function robotsForOrigin(
+	url: string,
+	cache: Map<string, RobotsRules | null>,
+	userAgent: string,
+): Promise<RobotsRules | null> {
 	let origin: string;
 	try {
 		origin = new URL(url).origin;
 	} catch {
 		return null;
 	}
-	if (robotsCache.has(origin)) return robotsCache.get(origin) ?? null;
-	const rules = await fetchRobots(url);
-	robotsCache.set(origin, rules);
+	if (cache.has(origin)) return cache.get(origin) ?? null;
+	const rules = await fetchRobots(url, userAgent);
+	cache.set(origin, rules);
 	return rules;
 }
 
@@ -247,6 +296,20 @@ export function isTerminal(status: string): boolean {
 	return (
 		status === "completed" || status === "failed" || status === "cancelled"
 	);
+}
+
+// Single source of truth for the terminal status: an explicit cancel/failure
+// wins, an all-failed run is `failed`, anything else is `completed`.
+export function decideTerminalStatus(
+	attempted: number,
+	succeeded: number,
+	currentStatus: string,
+): CrawlStatus {
+	if (currentStatus === "cancelled" || currentStatus === "failed") {
+		return currentStatus;
+	}
+	if (attempted > 0 && succeeded === 0) return "failed";
+	return "completed";
 }
 
 function toPositiveInt(value: unknown, fallback: number): number {
@@ -303,8 +366,10 @@ export function parseCrawlOptions(raw: unknown): StoredCrawlOptions {
 
 	let scrapeFormats: string[] = [];
 	let jsonFormat: { schema?: unknown; prompt?: string } | null = null;
+	let summaryRequested = false;
 	try {
 		const normalized = normalizeFormats(rawFormats);
+		summaryRequested = normalized.wantsSummary;
 		scrapeFormats = normalized.strings
 			.filter((format) => format !== "summary")
 			.map((format) =>
@@ -328,6 +393,11 @@ export function parseCrawlOptions(raw: unknown): StoredCrawlOptions {
 			? source.sitemap
 			: "include";
 
+	const robotsUserAgent =
+		typeof source.robotsUserAgent === "string" && source.robotsUserAgent !== ""
+			? source.robotsUserAgent
+			: undefined;
+
 	return {
 		limit: toPositiveInt(source.limit, DEFAULT_LIMIT),
 		maxDiscoveryDepth: toNonNegativeInt(
@@ -342,6 +412,8 @@ export function parseCrawlOptions(raw: unknown): StoredCrawlOptions {
 		sitemap,
 		scrapeFormats,
 		jsonFormat,
+		robotsUserAgent,
+		summaryRequested,
 		webhook: parseWebhook(source.webhook),
 	};
 }
@@ -377,15 +449,19 @@ export async function initializeCrawl(
 	opts: CrawlOptions,
 ): Promise<{ seeded: number }> {
 	const now = Date.now();
+	const userAgent = crawlUserAgent(opts);
 
 	let rules: RobotsRules | null = null;
 	if (!opts.ignoreRobotsTxt) {
-		rules = await fetchRobots(jobUrl);
+		rules = await fetchRobots(jobUrl, userAgent);
 	}
 
 	let seeded = 0;
 
 	// The seed is enqueued first so it holds the lowest id and is claimed first.
+	// `sitemap:"only"` never enqueues (or crawls) the seed: only sitemap URLs.
+	// `crawl.ts` already enqueues/bumps the seed at creation, so this re-enqueue
+	// inserts 0 rows for it and cannot double-count `total`.
 	if (opts.sitemap !== "only") {
 		seeded += await enqueueUrls(
 			env.DB,
@@ -396,7 +472,11 @@ export async function initializeCrawl(
 	}
 
 	if (opts.sitemap !== "skip") {
-		const sitemapUrls = await fetchSitemapUrls(jobUrl, { limit: opts.limit });
+		const sitemapUrls = await fetchSitemapUrls(jobUrl, {
+			limit: opts.limit,
+			maxFiles: SITEMAP_MAX_FILES,
+			timeoutMs: SITEMAP_TIMEOUT_MS,
+		});
 		const filtered = filterDiscoveredLinks(
 			jobUrl,
 			sitemapUrls,
@@ -421,6 +501,7 @@ export async function processCrawlBatch(
 	jobId: string,
 	batch: CrawlBatch[],
 	opts: CrawlOptions,
+	remaining?: number,
 ): Promise<CrawlBatchResult> {
 	const counts: CrawlBatchResult = { completed: 0, failed: 0, discovered: 0 };
 	if (batch.length === 0) return counts;
@@ -429,8 +510,11 @@ export async function processCrawlBatch(
 	const first = await getJob(db, jobId);
 	if (!first || isTerminal(first.status)) return counts;
 
-	robotsCache = new Map();
+	const userAgent = crawlUserAgent(opts);
+	const seedUrl = normalizeUrl(first.url);
+	const robotsCache = new Map<string, RobotsRules | null>();
 	const seen = new Set(batch.map((item) => item.url));
+	let crawlDelaySec = 0;
 
 	let browser: BrowserHandle | undefined;
 	try {
@@ -438,12 +522,33 @@ export async function processCrawlBatch(
 		browser = await getBrowser(env);
 
 		for (const item of batch) {
+			// Enforce `limit` in-batch: stop as soon as this batch reaches the
+			// remaining success budget, and suppress its discoveries.
+			if (remaining !== undefined && counts.completed >= remaining) break;
+
 			const job = await getJob(db, jobId);
 			if (!job || isTerminal(job.status)) break;
 
+			// `sitemap:"only"` must never crawl the seed, even if a row for it
+			// exists (e.g. a job created before this rule landed).
+			if (opts.sitemap === "only" && normalizeUrl(item.url) === seedUrl) {
+				await markQueueItem(db, item.id, "done");
+				continue;
+			}
+
 			if (!opts.ignoreRobotsTxt) {
-				const rules = await robotsForOrigin(item.url);
+				const rules = await robotsForOrigin(item.url, robotsCache, userAgent);
+				if (rules?.crawlDelaySec !== undefined) {
+					crawlDelaySec = Math.max(crawlDelaySec, rules.crawlDelaySec);
+				}
 				if (rules && !isPathAllowed(rules, requestPath(item.url))) {
+					await insertResult(db, {
+						jobId,
+						url: item.url,
+						status: "failed",
+						error: ROBOTS_DISALLOWED,
+						now: Date.now(),
+					});
 					await markQueueItem(db, item.id, "failed");
 					counts.failed += 1;
 					continue;
@@ -456,6 +561,7 @@ export async function processCrawlBatch(
 					formats: ensureLinks(opts.scrapeFormats),
 					onlyMainContent: true,
 					timeout: SCRAPE_TIMEOUT_MS,
+					headers: { "User-Agent": userAgent },
 				});
 			} catch {
 				result = null;
@@ -467,8 +573,10 @@ export async function processCrawlBatch(
 				continue;
 			}
 
+			const warnings: string[] = [];
+			if (opts.summaryRequested) warnings.push(SUMMARY_UNSUPPORTED);
+
 			let json: unknown;
-			let warning: string | undefined;
 			if (opts.jsonFormat) {
 				try {
 					const extracted = await extractStructured(
@@ -480,15 +588,18 @@ export async function processCrawlBatch(
 						env,
 					);
 					if (extracted.data !== undefined) json = extracted.data;
-					if (extracted.warning !== undefined) warning = extracted.warning;
+					if (extracted.warning !== undefined) {
+						warnings.push(extracted.warning);
+					}
 				} catch (error) {
-					warning = `AI extraction failed: ${(error as Error).message}`;
+					warnings.push(`AI extraction failed: ${(error as Error).message}`);
 				}
 			}
 
-			const metadata = warning
-				? { ...(result.metadata ?? {}), warning }
-				: result.metadata;
+			const metadata =
+				warnings.length > 0
+					? { ...(result.metadata ?? {}), warning: warnings.join("; ") }
+					: result.metadata;
 
 			await insertResult(db, {
 				jobId,
@@ -507,6 +618,8 @@ export async function processCrawlBatch(
 			counts.completed += 1;
 			await bumpJobCounters(db, jobId, { completed: 1, now: Date.now() });
 
+			// Once the budget is spent, enqueue nothing further.
+			if (remaining !== undefined && counts.completed >= remaining) continue;
 			if (opts.sitemap === "only" || !Array.isArray(result.links)) continue;
 
 			const discovered = filterDiscoveredLinks(
@@ -528,7 +641,68 @@ export async function processCrawlBatch(
 		if (browser) await browser.close();
 	}
 
+	if (crawlDelaySec > 0) counts.crawlDelaySec = crawlDelaySec;
 	return counts;
+}
+
+// Claims and processes one batch. Any row still `processing` when the batch
+// settles (limit stop, cancellation, or a thrown error) is returned to
+// `pending`, so a retried Workflow step re-claims it instead of orphaning it.
+export async function runCrawlBatch(
+	env: Env,
+	jobId: string,
+	opts: CrawlOptions,
+	size: number,
+): Promise<CrawlRunResult> {
+	const batch = await claimNextBatch(env.DB, jobId, size);
+	if (batch.length === 0) {
+		return {
+			empty: true,
+			terminal: false,
+			completed: 0,
+			failed: 0,
+			discovered: 0,
+		};
+	}
+
+	// The budget is derived from the persisted counter, not passed in, so the
+	// Workflow never has to reason about it.
+	const job = await getJob(env.DB, jobId);
+	const remaining = job ? Math.max(opts.limit - job.completed, 0) : opts.limit;
+
+	const ids = batch.map((item) => item.id);
+	let counts: CrawlBatchResult;
+	try {
+		counts = await processCrawlBatch(env, jobId, batch, opts, remaining);
+	} catch (error) {
+		await resetQueueItems(env.DB, ids);
+		throw error;
+	}
+	await resetQueueItems(env.DB, ids);
+
+	const current = await getJob(env.DB, jobId);
+	return {
+		empty: false,
+		terminal: current ? isTerminal(current.status) : true,
+		...counts,
+	};
+}
+
+// Only a job still `scraping` may be finalized: an explicit cancel/failure
+// already recorded must never be overwritten by a later step.
+export async function finalizeCrawl(
+	env: Env,
+	jobId: string,
+	attempted: number,
+	succeeded: number,
+): Promise<CrawlStatus | null> {
+	const job = await getJob(env.DB, jobId);
+	if (!job) return null;
+	if (job.status !== "scraping") return job.status;
+
+	const status = decideTerminalStatus(attempted, succeeded, job.status);
+	await setJobStatus(env.DB, jobId, status, { completedAt: Date.now() });
+	return status;
 }
 
 function toJsonSchema(schema: unknown): Record<string, unknown> | undefined {
@@ -541,17 +715,18 @@ function toJsonSchema(schema: unknown): Record<string, unknown> | undefined {
 export async function buildTerminalPayload(
 	env: Env,
 	jobId: string,
-	status: string,
+	type: WebhookType,
+	metadata?: Record<string, unknown>,
 ): Promise<TerminalPayload> {
 	const [job, rows] = await Promise.all([
 		getJob(env.DB, jobId),
 		listResults(env.DB, jobId, { limit: TERMINAL_PAGE_SIZE }),
 	]);
 
-	return {
-		type: "crawl.completed",
+	const payload: TerminalPayload = {
+		type,
 		id: jobId,
-		status,
+		status: job?.status ?? (type === "crawl.failed" ? "failed" : "completed"),
 		total: job?.total ?? 0,
 		completed: job?.completed ?? 0,
 		data: rows.map((row) => {
@@ -569,14 +744,27 @@ export async function buildTerminalPayload(
 			return item;
 		}),
 	};
+	// `webhook.metadata` from the request is honoured here rather than stored
+	// and dropped.
+	if (metadata) payload.metadata = metadata;
+	return payload;
 }
 
 // Best-effort delivery: a webhook failure must never fail the crawl, so this
-// swallows the error after a single log line.
+// swallows the error after a single log line. `events`, when present, filters
+// which terminal statuses are delivered.
 export async function postWebhook(
 	webhook: StoredWebhook,
 	payload: TerminalPayload,
 ): Promise<boolean> {
+	if (
+		webhook.events &&
+		webhook.events.length > 0 &&
+		!webhook.events.includes(payload.status)
+	) {
+		return false;
+	}
+
 	try {
 		const response = await fetch(webhook.url, {
 			method: "POST",
