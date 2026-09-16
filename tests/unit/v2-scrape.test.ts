@@ -1,6 +1,7 @@
 import { OpenAPIRoute, fromHono } from "chanfana";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { extractStructured, summarize } from "../../src/ai/extract";
 import { extractContent, getBrowser } from "../../src/browser";
 import type { Env } from "../../src/index";
 import {
@@ -14,6 +15,13 @@ import {
 vi.mock("../../src/browser", () => ({
 	getBrowser: vi.fn(),
 	extractContent: vi.fn(),
+}));
+
+// The AI pipeline is exercised in its own unit tests; here it is stubbed so no
+// provider or network is involved.
+vi.mock("../../src/ai/extract", () => ({
+	extractStructured: vi.fn(),
+	summarize: vi.fn(),
 }));
 
 // src/index.ts imports the v1 routes and /v2/search, which pull in
@@ -475,47 +483,131 @@ describe("V2Scrape unimplemented formats", () => {
 	});
 });
 
-describe("V2Scrape AI placeholders", () => {
-	it("omits json and warns while still scraping", async () => {
+describe("V2Scrape AI formats", () => {
+	it("populates data.json from the extraction pipeline", async () => {
+		vi.mocked(extractStructured).mockResolvedValue({
+			data: { price: 3 },
+			attempts: 1,
+			model: "test-model",
+		});
 		const res = await postScrape({
 			url: "https://example.com",
-			formats: [{ type: "json", prompt: "price" }],
+			formats: [{ type: "json", schema: { type: "object" } }],
 		});
+		expect(res.status).toBe(200);
 		const body = await res.json();
-		expect("json" in body.data).toBe(false);
-		expect(body.data.warning).toBe(
-			"json format requires AI configuration (not yet available)",
+		expect(body.data.json).toEqual({ price: 3 });
+		expect("warning" in body.data).toBe(false);
+		// markdown is fetched for the pipeline but must not leak into the output.
+		expect("markdown" in body.data).toBe(false);
+		expect(extractStructured).toHaveBeenCalledWith(
+			{
+				content: "# Example Domain",
+				jsonSchema: { type: "object" },
+				prompt: undefined,
+			},
+			env,
 		);
-		expect(extractContent).toHaveBeenCalledTimes(1);
+		// The AI formats need markdown, even when the caller did not ask for it.
+		expect(extractContent).toHaveBeenCalledWith(
+			expect.anything(),
+			"https://example.com",
+			expect.objectContaining({ formats: ["markdown"] }),
+		);
 	});
 
-	it("omits summary and warns while still scraping", async () => {
+	it("passes a prompt-only json request through without a schema", async () => {
+		vi.mocked(extractStructured).mockResolvedValue({
+			data: "three dollars",
+			attempts: 1,
+		});
+		const res = await postScrape({
+			url: "https://example.com",
+			formats: [{ type: "json", prompt: "get the price" }],
+		});
+		const body = await res.json();
+		expect(body.data.json).toBe("three dollars");
+		expect(extractStructured).toHaveBeenCalledWith(
+			{
+				content: "# Example Domain",
+				jsonSchema: undefined,
+				prompt: "get the price",
+			},
+			env,
+		);
+	});
+
+	it("populates data.summary from the summarizer", async () => {
+		vi.mocked(summarize).mockResolvedValue({
+			summary: "A summary.",
+			model: "test-model",
+		});
 		const res = await postScrape({
 			url: "https://example.com",
 			formats: [{ type: "summary" }],
 		});
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.data.summary).toBe("A summary.");
+		expect("markdown" in body.data).toBe(false);
+		expect(summarize).toHaveBeenCalledWith(
+			{ content: "# Example Domain" },
+			env,
+		);
+	});
+
+	it("keeps the scrape at 200 when the pipeline warns", async () => {
+		vi.mocked(summarize).mockResolvedValue({
+			warning: "AI not configured: no AI provider configured",
+		});
+		const res = await postScrape({
+			url: "https://example.com",
+			formats: [{ type: "summary" }],
+		});
+		expect(res.status).toBe(200);
 		const body = await res.json();
 		expect("summary" in body.data).toBe(false);
 		expect(body.data.warning).toBe(
-			"summary format requires AI configuration (not yet available)",
+			"AI not configured: no AI provider configured",
 		);
 		expect(extractContent).toHaveBeenCalledTimes(1);
 	});
 
-	it("joins every warning into one string inside data", async () => {
+	it("lands a json pipeline warning in data.warning and still returns 200", async () => {
+		vi.mocked(extractStructured).mockResolvedValue({
+			warning: "extraction failed validation after 3 attempts: bad price",
+			attempts: 3,
+		});
+		const res = await postScrape({
+			url: "https://example.com",
+			formats: [{ type: "json", prompt: "price" }],
+		});
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect("json" in body.data).toBe(false);
+		expect(body.data.warning).toBe(
+			"extraction failed validation after 3 attempts: bad price",
+		);
+	});
+
+	it("joins pipeline warnings with format warnings", async () => {
+		vi.mocked(extractStructured).mockResolvedValue({
+			warning: "extraction failed validation after 3 attempts: bad price",
+			attempts: 3,
+		});
 		const res = await postScrape({
 			url: "https://example.com",
 			formats: [
 				"screenshot@fullPage",
 				{ type: "screenshot", quality: 90 },
-				{ type: "json" },
+				{ type: "json", prompt: "price" },
 			],
 		});
 		const body = await res.json();
 		expect(body.data.warning).toBe(
 			"screenshot@fullPage is v1; use {type:'screenshot',fullPage:true}; " +
 				"screenshot quality/viewport options are ignored; " +
-				"json format requires AI configuration (not yet available)",
+				"extraction failed validation after 3 attempts: bad price",
 		);
 	});
 });
