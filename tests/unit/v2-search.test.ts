@@ -191,6 +191,147 @@ describe("V2Search response envelope", () => {
 	});
 });
 
+describe("V2Search input forwarding", () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+	});
+
+	it("forwards every supported contract field exactly as sent", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: {},
+			warnings: [],
+		});
+
+		await postSearch({
+			query: "test",
+			limit: 7,
+			tbs: "qdr:m",
+			lang: "de",
+			country: "de",
+			location: "Berlin",
+			safe: false,
+			includeDomains: ["example.com"],
+		});
+
+		expect(searchWithFallback).toHaveBeenCalledWith(
+			expect.objectContaining({
+				query: "test",
+				limit: 7,
+				sources: ["web"],
+				tbs: "qdr:m",
+				lang: "de",
+				country: "de",
+				location: "Berlin",
+				safe: false,
+				includeDomains: ["example.com"],
+			}),
+			env,
+		);
+	});
+
+	it("forwards excludeDomains when provided", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: {},
+			warnings: [],
+		});
+
+		await postSearch({
+			query: "test",
+			excludeDomains: ["spam.example"],
+		});
+
+		expect(searchWithFallback).toHaveBeenCalledWith(
+			expect.objectContaining({ excludeDomains: ["spam.example"] }),
+			env,
+		);
+	});
+});
+
+describe("V2Search sources", () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+	});
+
+	it("accepts the typed-object source form and queries both sources", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: {},
+			warnings: [],
+		});
+
+		const res = await postSearch({
+			query: "test",
+			sources: [{ type: "web" }, { type: "news" }],
+		});
+		expect(res.status).toBe(200);
+		expect(searchWithFallback).toHaveBeenCalledWith(
+			expect.objectContaining({ sources: ["web", "news"] }),
+			env,
+		);
+	});
+
+	it("accepts mixed string and object source forms", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: {},
+			warnings: [],
+		});
+
+		const res = await postSearch({
+			query: "test",
+			sources: ["web", { type: "images" }],
+		});
+		expect(res.status).toBe(200);
+		expect(searchWithFallback).toHaveBeenCalledWith(
+			expect.objectContaining({ sources: ["web", "images"] }),
+			env,
+		);
+	});
+
+	it("dedupes repeated sources preserving first-seen order", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: {},
+			warnings: [],
+		});
+
+		await postSearch({
+			query: "test",
+			sources: ["web", { type: "web" }, "news", { type: "news" }],
+		});
+
+		expect(searchWithFallback).toHaveBeenCalledWith(
+			expect.objectContaining({ sources: ["web", "news"] }),
+			env,
+		);
+	});
+
+	it("accepts-and-ignores per-source location and tbs", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: {},
+			warnings: [],
+		});
+
+		const res = await postSearch({
+			query: "test",
+			sources: [{ type: "web", location: "Portland", tbs: "qdr:w" }],
+		});
+		expect(res.status).toBe(200);
+		expect(searchWithFallback).toHaveBeenCalledWith(
+			expect.objectContaining({ sources: ["web"] }),
+			env,
+		);
+	});
+
+	it("rejects an unknown type in the object form", async () => {
+		const res = await postSearch({
+			query: "test",
+			sources: [{ type: "alexandria" }],
+		});
+		expect(res.status).toBe(400);
+		const body = await res.json();
+		expect(body.success).toBe(false);
+		expect(searchWithFallback).not.toHaveBeenCalled();
+	});
+});
+
 describe("V2Search warnings", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
@@ -219,6 +360,35 @@ describe("V2Search warnings", () => {
 		const body = await res.json();
 		expect("warning" in body).toBe(false);
 	});
+
+	it("warns when ignoreInvalidURLs is explicitly false", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: { web: webResults },
+			warnings: [],
+		});
+
+		const res = await postSearch({ query: "test", ignoreInvalidURLs: false });
+		const body = await res.json();
+		expect(body.warning).toBe(
+			"ignoreInvalidURLs:false is not supported; invalid URLs are always skipped",
+		);
+	});
+
+	it("does not warn when ignoreInvalidURLs is true or omitted", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: { web: webResults },
+			warnings: [],
+		});
+
+		const withTrue = await postSearch({
+			query: "test",
+			ignoreInvalidURLs: true,
+		});
+		const omitted = await postSearch({ query: "test" });
+
+		expect("warning" in (await withTrue.json())).toBe(false);
+		expect("warning" in (await omitted.json())).toBe(false);
+	});
 });
 
 describe("V2Search validation", () => {
@@ -234,9 +404,45 @@ describe("V2Search validation", () => {
 		expect(searchWithFallback).not.toHaveBeenCalled();
 	});
 
-	it("rejects a limit below 1", async () => {
+	it("rejects a limit below 1 with a 400 error body", async () => {
 		const res = await postSearch({ query: "test", limit: 0 });
 		expect(res.status).toBe(400);
+		const body = await res.json();
+		expect(body.success).toBe(false);
+		expect(Array.isArray(body.errors)).toBe(true);
+		expect(body.errors.length).toBeGreaterThan(0);
+		expect(searchWithFallback).not.toHaveBeenCalled();
+	});
+
+	it("rejects a query longer than 500 characters", async () => {
+		const res = await postSearch({ query: "a".repeat(501) });
+		expect(res.status).toBe(400);
+		const body = await res.json();
+		expect(body.success).toBe(false);
+		expect(searchWithFallback).not.toHaveBeenCalled();
+	});
+
+	it("accepts a query of exactly 500 characters", async () => {
+		vi.mocked(searchWithFallback).mockResolvedValue({
+			results: {},
+			warnings: [],
+		});
+
+		const res = await postSearch({ query: "a".repeat(500) });
+		expect(res.status).toBe(200);
+	});
+
+	it("rejects a non-positive or fractional timeout", async () => {
+		const zero = await postSearch({ query: "test", timeout: 0 });
+		expect(zero.status).toBe(400);
+
+		const negative = await postSearch({ query: "test", timeout: -1 });
+		expect(negative.status).toBe(400);
+
+		const fractional = await postSearch({ query: "test", timeout: 1.5 });
+		expect(fractional.status).toBe(400);
+
+		expect(searchWithFallback).not.toHaveBeenCalled();
 	});
 
 	it("rejects an unknown source value", async () => {
@@ -272,9 +478,14 @@ describe("V2Search validation", () => {
 		expect(res.status).toBe(200);
 	});
 
-	it("rejects a missing query", async () => {
+	it("rejects a missing query with a 400 error body", async () => {
 		const res = await postSearch({});
 		expect(res.status).toBe(400);
+		const body = await res.json();
+		expect(body.success).toBe(false);
+		expect(Array.isArray(body.errors)).toBe(true);
+		expect(body.errors.length).toBeGreaterThan(0);
+		expect(searchWithFallback).not.toHaveBeenCalled();
 	});
 });
 

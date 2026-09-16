@@ -29,22 +29,61 @@ function pruneEmptySources(results: SearchResults): SearchResults {
 	return pruned;
 }
 
+const sourceTypeSchema = z.enum(["web", "news", "images"]);
+type SourceType = z.infer<typeof sourceTypeSchema>;
+
+// The vendor SDK sends sources as objects (`{type:"web"}`) while older callers
+// send bare strings; both are accepted. Per-source `location`/`tbs` are
+// accepted-and-ignored — only `type` is read, and the top-level `location`/`tbs`
+// remain the ones forwarded to the provider.
+const sourceSchema = z.union([
+	sourceTypeSchema,
+	z.object({
+		type: sourceTypeSchema,
+		location: z.string().optional(),
+		tbs: z.string().optional(),
+	}),
+]);
+
+// Collapse both source forms to the string list the provider expects, deduping
+// repeats while preserving first-seen order.
+function normalizeSources(
+	entries: z.infer<typeof sourceSchema>[],
+): SourceType[] {
+	const seen = new Set<SourceType>();
+	const sources: SourceType[] = [];
+	for (const entry of entries) {
+		const type = typeof entry === "string" ? entry : entry.type;
+		if (seen.has(type)) continue;
+		seen.add(type);
+		sources.push(type);
+	}
+	return sources;
+}
+
+// Accepted-and-ignored contract fields (Cloud-only vendor features / future
+// tasks) are deliberately absent below, so zod strips them before `handle`
+// runs instead of rejecting the request: `categories`, `highlights`,
+// `enterprise`, `threatProtection`, `domainTools`, `integration`, `origin`,
+// and `scrapeOptions` (a separate future task).
 const searchBodySchema = z
 	.object({
-		query: z.string(),
+		query: z.string().max(500),
 		limit: z.number().int().min(1).max(100).default(10),
-		sources: z.enum(["web", "news", "images"]).array().default(["web"]),
+		sources: z.array(sourceSchema).default(["web"]),
 		tbs: z.string().optional(),
-		lang: z.string().default("en").optional(),
+		lang: z.string().default("en"),
 		country: z.string().optional(),
 		location: z.string().optional(),
 		safe: z.boolean().optional(),
 		includeDomains: z.string().array().optional(),
 		excludeDomains: z.string().array().optional(),
-		// Accepted for SDK compatibility; providers own their request timeouts
-		// today, so this value does not bound anything beyond validation yet.
-		timeout: z.number().default(60000).optional(),
-		ignoreInvalidURLs: z.boolean().default(false).optional(),
+		// Accepted for contract compatibility but bounds nothing extra today:
+		// providers own their own request timeouts.
+		timeout: z.number().int().positive().optional(),
+		// Providers always drop non-http/unparseable result URLs, so an explicit
+		// `false` cannot be honoured; `handle` reports it as a warning instead.
+		ignoreInvalidURLs: z.boolean().optional(),
 	})
 	.refine(
 		(body) => !(body.includeDomains?.length && body.excludeDomains?.length),
@@ -92,6 +131,7 @@ export class V2Search extends OpenAPIRoute {
 	async handle(c: AppContext) {
 		const data = await this.getValidatedData<typeof this.schema>();
 		const body = data.body;
+		const sources = normalizeSources(body.sources);
 
 		try {
 			// Forward exactly the fields `SearchInput` understands; `timeout` and
@@ -100,7 +140,7 @@ export class V2Search extends OpenAPIRoute {
 				{
 					query: body.query,
 					limit: body.limit,
-					sources: body.sources,
+					sources,
 					tbs: body.tbs,
 					lang: body.lang,
 					country: body.country,
@@ -112,6 +152,13 @@ export class V2Search extends OpenAPIRoute {
 				c.env,
 			);
 
+			const warnings = [...outcome.warnings];
+			if (body.ignoreInvalidURLs === false) {
+				warnings.push(
+					"ignoreInvalidURLs:false is not supported; invalid URLs are always skipped",
+				);
+			}
+
 			const payload: {
 				success: true;
 				data: SearchResults;
@@ -120,8 +167,8 @@ export class V2Search extends OpenAPIRoute {
 				success: true,
 				data: pruneEmptySources(outcome.results),
 			};
-			if (outcome.warnings.length > 0) {
-				payload.warning = outcome.warnings.join("; ");
+			if (warnings.length > 0) {
+				payload.warning = warnings.join("; ");
 			}
 			return payload;
 		} catch (error) {
