@@ -47,60 +47,85 @@ function randomJobId(now: number): string {
 	return `crawl_${now}_${suffix}`;
 }
 
+// Single source of truth for the crawl request contract. Exported so
+// `/v2/crawl/params-preview` validates against exactly the same schema while
+// `POST /v2/crawl` keeps its behaviour unchanged.
+export const crawlRequestSchema = z.object({
+	url: z.string().url(),
+	limit: z
+		.number()
+		.int()
+		.min(1)
+		.max(MAX_LIMIT)
+		.default(DEFAULT_LIMIT)
+		.optional(),
+	maxDiscoveryDepth: z.number().int().min(0).max(10).optional(),
+	allowExternalLinks: z.boolean().default(false).optional(),
+	allowSubdomains: z.boolean().default(false).optional(),
+	// Contract bounds: each entry at most 2000 chars, at most 1000
+	// entries per field.
+	includePaths: z.string().max(2000).array().max(1000).optional(),
+	excludePaths: z.string().max(2000).array().max(1000).optional(),
+	ignoreRobotsTxt: z.boolean().default(false).optional(),
+	sitemap: z.enum(["skip", "include", "only"]).default("include").optional(),
+	// Only `formats` is implemented; `.passthrough()` keeps any
+	// other scrape sub-field so `handle` can name it in the warning.
+	scrapeOptions: z
+		.object({ formats: z.array(scrapeFormatSchema).optional() })
+		.passthrough()
+		.optional(),
+	// Contract of record: `webhook` is an object (url required).
+	webhook: z
+		.object({
+			url: z.string().url(),
+			headers: z.record(z.string()).optional(),
+			metadata: z.record(z.unknown()).optional(),
+			events: z.string().array().optional(),
+		})
+		.optional(),
+	// Accepted-and-ignored: see IGNORED_FIELDS.
+	crawlEntireDomain: z.boolean().optional(),
+	delay: z.number().optional(),
+	ignoreQueryParameters: z.boolean().default(false).optional(),
+	maxConcurrency: z.number().int().optional(),
+	regexOnFullURL: z.boolean().optional(),
+	robotsUserAgent: z.string().optional(),
+	zeroDataRetention: z.boolean().optional(),
+	prompt: z.string().optional(),
+	excludeTags: z.string().array().optional(),
+	includeTags: z.string().array().optional(),
+});
+
+// Names the request fields that were accepted but are not acted on: the
+// documented IGNORED_FIELDS plus any `scrapeOptions` sub-field other than
+// `formats`. Shared with `/v2/crawl/params-preview` so both endpoints report the
+// same set instead of drifting.
+export function collectIgnoredFields(body: Record<string, unknown>): string[] {
+	const ignored: string[] = IGNORED_FIELDS.filter(
+		(field) => body[field] !== undefined,
+	);
+
+	const scrapeOptions = body.scrapeOptions as
+		| Record<string, unknown>
+		| undefined;
+	if (scrapeOptions) {
+		for (const key of Object.keys(scrapeOptions)) {
+			if (key !== "formats") {
+				ignored.push(`scrapeOptions.${key}`);
+			}
+		}
+	}
+
+	return ignored.sort();
+}
+
 export class V2Crawl extends OpenAPIRoute {
 	schema = {
 		request: {
 			body: {
 				content: {
 					"application/json": {
-						schema: z.object({
-							url: z.string().url(),
-							limit: z
-								.number()
-								.int()
-								.min(1)
-								.max(MAX_LIMIT)
-								.default(DEFAULT_LIMIT)
-								.optional(),
-							maxDiscoveryDepth: z.number().int().min(0).max(10).optional(),
-							allowExternalLinks: z.boolean().default(false).optional(),
-							allowSubdomains: z.boolean().default(false).optional(),
-							// Contract bounds: each entry at most 2000 chars, at most 1000
-							// entries per field.
-							includePaths: z.string().max(2000).array().max(1000).optional(),
-							excludePaths: z.string().max(2000).array().max(1000).optional(),
-							ignoreRobotsTxt: z.boolean().default(false).optional(),
-							sitemap: z
-								.enum(["skip", "include", "only"])
-								.default("include")
-								.optional(),
-							// Only `formats` is implemented; `.passthrough()` keeps any
-							// other scrape sub-field so `handle` can name it in the warning.
-							scrapeOptions: z
-								.object({ formats: z.array(scrapeFormatSchema).optional() })
-								.passthrough()
-								.optional(),
-							// Contract of record: `webhook` is an object (url required).
-							webhook: z
-								.object({
-									url: z.string().url(),
-									headers: z.record(z.string()).optional(),
-									metadata: z.record(z.unknown()).optional(),
-									events: z.string().array().optional(),
-								})
-								.optional(),
-							// Accepted-and-ignored: see IGNORED_FIELDS.
-							crawlEntireDomain: z.boolean().optional(),
-							delay: z.number().optional(),
-							ignoreQueryParameters: z.boolean().default(false).optional(),
-							maxConcurrency: z.number().int().optional(),
-							regexOnFullURL: z.boolean().optional(),
-							robotsUserAgent: z.string().optional(),
-							zeroDataRetention: z.boolean().optional(),
-							prompt: z.string().optional(),
-							excludeTags: z.string().array().optional(),
-							includeTags: z.string().array().optional(),
-						}),
+						schema: crawlRequestSchema,
 					},
 				},
 			},
@@ -215,23 +240,7 @@ export class V2Crawl extends OpenAPIRoute {
 			);
 		}
 
-		const ignored: string[] = IGNORED_FIELDS.filter(
-			(field) => (body as Record<string, unknown>)[field] !== undefined,
-		);
-
-		// `scrapeOptions` is only honoured for `formats`; name any other sub-field
-		// it carried so callers are not misled into thinking it took effect.
-		const scrapeOptions = body.scrapeOptions as
-			| Record<string, unknown>
-			| undefined;
-		if (scrapeOptions) {
-			for (const key of Object.keys(scrapeOptions)) {
-				if (key !== "formats") {
-					ignored.push(`scrapeOptions.${key}`);
-				}
-			}
-		}
-		ignored.sort();
+		const ignored = collectIgnoredFields(body as Record<string, unknown>);
 
 		const payload: {
 			success: true;

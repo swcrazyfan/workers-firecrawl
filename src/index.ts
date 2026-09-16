@@ -3,6 +3,11 @@ import { type Context, Hono } from "hono";
 import { authorizationMiddleware } from "./authorization";
 import { WebScrape } from "./scrape";
 import { V2Crawl } from "./v2/crawl";
+import {
+	V2CrawlActive,
+	V2CrawlErrors,
+	V2CrawlParamsPreview,
+} from "./v2/crawlExtras";
 import { V2CrawlStatus } from "./v2/crawlStatus";
 import { V2Map } from "./v2/map";
 import { V2Scrape } from "./v2/scrape";
@@ -47,6 +52,12 @@ openapi.post("/v2/map", V2Map);
 openapi.post("/v2/search", V2Search);
 openapi.post("/v2/scrape", V2Scrape);
 openapi.post("/v2/crawl", V2Crawl);
+// Literal crawl paths MUST be registered before the parameterised `/v2/crawl/:id`
+// routes: Hono's router matches `/v2/crawl/active` against `:id` otherwise,
+// which would swallow it into the status handler.
+openapi.get("/v2/crawl/active", V2CrawlActive);
+openapi.post("/v2/crawl/params-preview", V2CrawlParamsPreview);
+openapi.get("/v2/crawl/:id/errors", V2CrawlErrors);
 openapi.get("/v2/crawl/:id", V2CrawlStatus);
 openapi.delete("/v2/crawl/:id", V2CrawlStatus);
 
