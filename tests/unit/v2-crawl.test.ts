@@ -329,17 +329,17 @@ describe("POST /v2/crawl", () => {
 	it("marks the job failed and returns 503 when the binding is absent", async () => {
 		const res = await postCrawl({ url: SEED }, makeEnv());
 		expect(res.status).toBe(503);
-		expect(await res.json()).toEqual({
-			success: false,
-			error: "crawl engine not configured",
-		});
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(body.success).toBe(false);
+		expect(body.error).toBe("crawl engine not configured");
+		expect(String(body.details)).toContain("crawl engine not configured");
 
 		const rows = await env.DB.prepare(
 			"SELECT status, error, completed_at FROM crawl_jobs",
 		).all<{ status: string; error: string; completed_at: number | null }>();
 		expect(rows.results).toHaveLength(1);
 		expect(rows.results[0].status).toBe("failed");
-		expect(rows.results[0].error).toBe("crawl engine not configured");
+		expect(rows.results[0].error).toContain("crawl engine not configured");
 		expect(rows.results[0].completed_at).toEqual(expect.any(Number));
 	});
 
@@ -350,14 +350,16 @@ describe("POST /v2/crawl", () => {
 		};
 		const res = await postCrawl({ url: SEED }, makeEnv(workflow));
 		expect(res.status).toBe(503);
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(body.details).toBe("workflow unavailable");
 
 		const rows = await env.DB.prepare(
 			"SELECT status, error FROM crawl_jobs",
 		).all<{ status: string; error: string }>();
-		expect(rows.results[0]).toEqual({
-			status: "failed",
-			error: "crawl engine not configured",
-		});
+		expect(rows.results[0].status).toBe("failed");
+		expect(rows.results[0].error).toBe(
+			"crawl engine not configured: workflow unavailable",
+		);
 	});
 
 	it("returns a structured 500 and creates no row when the job insert fails", async () => {

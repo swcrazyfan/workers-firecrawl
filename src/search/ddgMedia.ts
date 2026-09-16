@@ -460,32 +460,55 @@ export async function ddgMediaSearch(
 	}
 
 	const jobs: Array<Promise<SourceOutcome>> = [];
+	// DDG intermittently 403s these endpoints per egress IP (verified in
+	// production). The block is often tied to the vqd session — one retry
+	// with a freshly extracted token recovers a meaningful share of hits.
+	const retryOn403 = async (
+		run: (token: string) => Promise<SourceOutcome>,
+	): Promise<SourceOutcome> => {
+		const first = await run(vqd);
+		if (!first.warning?.includes("403")) return first;
+		try {
+			const fresh = await extractVqd(query, kl, input.lang);
+			const second = await run(fresh);
+			if (second.items.length > 0 || !second.warning?.includes("403")) {
+				return second;
+			}
+		} catch {
+			// retry itself failed — surface the original outcome
+		}
+		return first;
+	};
 	if (wantsNews) {
 		jobs.push(
-			runNews(() =>
-				collectNews(
-					query,
-					kl,
-					vqd,
-					mapped.df,
-					input.safe,
-					input.lang,
-					input.limit,
+			retryOn403((token) =>
+				runNews(() =>
+					collectNews(
+						query,
+						kl,
+						token,
+						mapped.df,
+						input.safe,
+						input.lang,
+						input.limit,
+					),
 				),
 			),
 		);
 	}
 	if (wantsImages) {
 		jobs.push(
-			runImages(() =>
-				collectImages(
-					query,
-					kl,
-					vqd,
-					imagesTimeFilter(mapped.timeRange),
-					input.safe,
-					input.lang,
-					input.limit,
+			retryOn403((token) =>
+				runImages(() =>
+					collectImages(
+						query,
+						kl,
+						token,
+						imagesTimeFilter(mapped.timeRange),
+						input.safe,
+						input.lang,
+						input.limit,
+					),
 				),
 			),
 		);

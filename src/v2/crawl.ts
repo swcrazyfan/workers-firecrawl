@@ -202,15 +202,14 @@ export class V2Crawl extends OpenAPIRoute {
 			}
 			await workflow.create({ id: jobId, params: { jobId } });
 		} catch (error) {
-			console.error(
-				`Crawl enqueue failed for ${jobId}: ${(error as Error).message}`,
-			);
+			const reason = (error as Error).message ?? String(error);
+			console.error(`Crawl enqueue failed for ${jobId}: ${reason}`);
 			await setJobStatus(c.env.DB, jobId, "failed", {
-				error: ENGINE_NOT_CONFIGURED,
+				error: `${ENGINE_NOT_CONFIGURED}: ${reason}`,
 				completedAt: now,
 			});
 			return Response.json(
-				{ success: false, error: ENGINE_NOT_CONFIGURED },
+				{ success: false, error: ENGINE_NOT_CONFIGURED, details: reason },
 				{ status: 503 },
 			);
 		}

@@ -45,6 +45,13 @@ export async function ddgBrowserSearch(
 	try {
 		const page = await browser.newPage();
 		try {
+			// DDG's SPA serves an empty shell to the default headless UA
+			// (verified in production: results never render without this).
+			// Legacy deployment proved this UA + viewport combination works.
+			await page.setViewport({ width: 1920, height: 1080 });
+			await page.setUserAgent(
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+			);
 			// Same query/param mapping as ddg.ts: domain filters fold into q,
 			// kl from the region hints, df from tbs, kp from safe.
 			const mapped = mapTbs(input.tbs);
