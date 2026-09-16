@@ -73,10 +73,10 @@ docs/specs/              # per-task implementation specs (agents read these)
 | 009 | ✅ `/v2/scrape` format objects (PR #9) | `src/v2/scrape.ts` | — | 3 |
 | 010a | ✅ AI core: config + provider seam + OpenAI-compat (PR #11) | `src/ai/*` | — | 4 |
 | 010b | ✅ AI: Workers AI provider (PR #12) | `src/ai/workersAiProvider.ts` | 010a | 4 |
-| 010c | AI: extract pipeline + prompts + scrape wiring | `src/ai/extract.ts`, `prompt.ts`, `src/v2/scrape.ts` | 010a/b, 009 | 4 |
+| 010c | ✅ AI extraction pipeline + prompts + wiring (PR #13) | `src/ai/*` | 010a/b | 4 |
 | 010 | robots + sitemap utils | `src/crawler/robots.ts`, `src/crawler/sitemap.ts` | — | 3 |
-| 011 | D1 schema + crawl endpoints | `migrations/`, `src/v2/crawl*.ts` | — | 4 |
-| 012 | Crawl Workflow + batch engine | `src/crawler/workflow.ts`, `batch.ts`, wrangler wiring | 010, 011, 009c | 4 |
+| 011 | ✅ D1 storage + crawl endpoints (PR #14) | `migrations/`, `src/v2/crawl*.ts` | — | 4 |
+| 012 | ✅ Crawl Workflow + engine + robots (PR #15) | `src/crawler/{workflow,engine,robots}.ts` | 011 | 4 |
 | 013 | Crawl extras (errors/active/params-preview) | `src/v2/crawlExtras.ts` | 011 | 5 |
 | 014 | README, changeset, deploy, decommission old workers | docs/deploy | all | 5 |
 
