@@ -133,6 +133,47 @@ describe("normalizeJsonSchema", () => {
 		expect((schema.properties as Record<string, unknown>).self).toBeDefined();
 	});
 
+	it("caps a non-cyclic deep $ref chain", () => {
+		const defs: Record<string, unknown> = {};
+		for (let index = 0; index < 12; index += 1) {
+			defs[`D${index}`] =
+				index === 11 ? { type: "string" } : { $ref: `#/$defs/D${index + 1}` };
+		}
+		const { warnings } = normalizeJsonSchema({
+			type: "object",
+			properties: { a: { $ref: "#/$defs/D0" } },
+			$defs: defs,
+		});
+		expect(warnings.some((warning) => warning.includes("depth cap"))).toBe(
+			true,
+		);
+	});
+
+	it("caps pathological structural nesting without throwing", () => {
+		let deep: Record<string, unknown> = { type: "string" };
+		for (let index = 0; index < 200000; index += 1) {
+			deep = { type: "object", properties: { child: deep } };
+		}
+		expect(() => normalizeJsonSchema(deep)).not.toThrow();
+		const { warnings } = normalizeJsonSchema(deep);
+		expect(warnings.some((warning) => warning.includes("depth cap"))).toBe(
+			true,
+		);
+	});
+
+	it("wraps a type:['array'] union as a required items object", () => {
+		const result = normalized({ type: ["array"], items: { type: "number" } });
+		expect(result.type).toBe("object");
+		expect(result.additionalProperties).toBe(false);
+		expect(result.required).toEqual(["items"]);
+	});
+
+	it("wraps an items-only schema as a required items object", () => {
+		const result = normalized({ items: { type: "string" } });
+		expect(result.type).toBe("object");
+		expect(result.required).toEqual(["items"]);
+	});
+
 	it("never mutates the input", () => {
 		const input = {
 			type: "object",
@@ -280,5 +321,95 @@ describe("validateAgainstSchema", () => {
 		expect(() =>
 			validateAgainstSchema({ a: 1 }, { type: "object", properties: 42 }),
 		).not.toThrow();
+	});
+
+	it("distinguishes integer from number", () => {
+		const integerSchema = {
+			type: "object",
+			properties: { n: { type: "integer" } },
+			required: ["n"],
+		};
+		expect(validateAgainstSchema({ n: 2 }, integerSchema).ok).toBe(true);
+		const bad = validateAgainstSchema({ n: 2.5 }, integerSchema);
+		expect(bad.ok).toBe(false);
+		if (!bad.ok) expect(bad.errors[0]).toBe("$.n: expected integer, got number");
+
+		const numberSchema = {
+			type: "object",
+			properties: { n: { type: "number" } },
+			required: ["n"],
+		};
+		expect(validateAgainstSchema({ n: 2.5 }, numberSchema).ok).toBe(true);
+		expect(validateAgainstSchema({ n: 2 }, numberSchema).ok).toBe(true);
+	});
+
+	it("rejects extra properties when additionalProperties is false", () => {
+		const schema = {
+			type: "object",
+			properties: { a: { type: "string" } },
+			required: ["a"],
+			additionalProperties: false,
+		};
+		expect(validateAgainstSchema({ a: "x" }, schema).ok).toBe(true);
+		const bad = validateAgainstSchema({ a: "x", b: 1 }, schema);
+		expect(bad.ok).toBe(false);
+		if (!bad.ok) {
+			expect(bad.errors.some((error) => error.includes("additional property"))).toBe(
+				true,
+			);
+		}
+	});
+
+	it("rejects extra properties in nested objects", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				inner: {
+					type: "object",
+					properties: { a: { type: "string" } },
+					required: ["a"],
+					additionalProperties: false,
+				},
+			},
+			required: ["inner"],
+			additionalProperties: false,
+		};
+		const bad = validateAgainstSchema({ inner: { a: "x", b: 1 } }, schema);
+		expect(bad.ok).toBe(false);
+		if (!bad.ok) {
+			expect(bad.errors.some((error) => error.includes("$.inner.b"))).toBe(true);
+		}
+	});
+
+	it("rejects additional properties end-to-end through normalization", () => {
+		const { schema } = normalizeJsonSchema({
+			type: "object",
+			properties: { price: { type: "number" } },
+		});
+		expect(validateAgainstSchema({ price: 1 }, schema).ok).toBe(true);
+		expect(validateAgainstSchema({ price: 1, extra: true }, schema).ok).toBe(
+			false,
+		);
+	});
+
+	it("distinguishes a missing property from an explicit null", () => {
+		const schema = {
+			type: "object",
+			properties: { name: { type: ["string", "null"] } },
+			required: ["name"],
+		};
+		expect(validateAgainstSchema({ name: null }, schema).ok).toBe(true);
+		const missing = validateAgainstSchema({}, schema);
+		expect(missing.ok).toBe(false);
+		if (!missing.ok) expect(missing.errors[0]).toContain("required");
+	});
+
+	it("compares enum object values order-insensitively", () => {
+		const schema = {
+			type: "object",
+			properties: { v: { enum: [{ b: 2, a: 1 }] } },
+			required: ["v"],
+		};
+		expect(validateAgainstSchema({ v: { a: 1, b: 2 } }, schema).ok).toBe(true);
 	});
 });

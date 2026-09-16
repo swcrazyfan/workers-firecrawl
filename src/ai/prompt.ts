@@ -69,14 +69,19 @@ export function buildExtractionMessages(input: {
 		{ role: "user", content: frame(content, nonce) },
 	];
 
+	// Only demand JSON-only output when a schema is present; the prompt-only
+	// path explicitly allows a raw-text answer.
+	const wantsJson = jsonSchema !== undefined;
 	const task = instruction?.trim();
-	messages.push({
-		role: "user",
-		content:
-			task && task.length > 0
-				? `${task}\n\nRespond with JSON only.`
-				: "Extract the data described by the schema above. Respond with JSON only.",
-	});
+	let finalTask: string;
+	if (task && task.length > 0) {
+		finalTask = wantsJson ? `${task}\n\nRespond with JSON only.` : task;
+	} else {
+		finalTask = wantsJson
+			? "Extract the data described by the schema above. Respond with JSON only."
+			: "Extract the requested data from the content above.";
+	}
+	messages.push({ role: "user", content: finalTask });
 
 	return messages;
 }

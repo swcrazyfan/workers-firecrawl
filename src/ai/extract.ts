@@ -4,6 +4,7 @@ import {
 	buildSummaryMessages,
 	makeNonce,
 	repairMessage,
+	sanitizeUntrusted,
 } from "./prompt";
 import type { AiProvider } from "./provider";
 import { getAiProvider } from "./provider";
@@ -11,9 +12,6 @@ import { normalizeJsonSchema, validateAgainstSchema } from "./schema";
 import type { AiConfig, AiEnv, ChatMessage, ChatResponse } from "./types";
 
 const SUMMARY_MAX_CHARS = 24000;
-// Room reserved for the truncation marker so head+tail+marker stays within the
-// budget even for very large drop counts.
-const TRUNCATION_MARKER_RESERVE = 64;
 
 function isHighSurrogate(code: number): boolean {
 	return code >= 0xd800 && code <= 0xdbff;
@@ -23,25 +21,54 @@ function isLowSurrogate(code: number): boolean {
 	return code >= 0xdc00 && code <= 0xdfff;
 }
 
+function truncationMarker(droppedChars: number): string {
+	return `\n\n…[truncated ${droppedChars} characters]…\n\n`;
+}
+
+// Never cut a surrogate pair in half.
+function safeSliceStart(content: string, length: number): string {
+	if (length <= 0) return "";
+	let slice = content.slice(0, length);
+	if (isHighSurrogate(slice.charCodeAt(slice.length - 1))) {
+		slice = slice.slice(0, -1);
+	}
+	return slice;
+}
+
 export function budgetContent(
 	content: string,
 	maxChars: number,
 ): { content: string; truncated: boolean; droppedChars: number } {
-	const limit = Number.isFinite(maxChars)
-		? Math.max(0, Math.trunc(maxChars))
-		: 0;
+	// A non-finite limit means "no limit" rather than "truncate everything".
+	if (!Number.isFinite(maxChars)) {
+		return { content, truncated: false, droppedChars: 0 };
+	}
+
+	const limit = Math.max(0, Math.trunc(maxChars));
 	if (content.length <= limit) {
 		return { content, truncated: false, droppedChars: 0 };
 	}
 
-	const budget = Math.max(0, limit - TRUNCATION_MARKER_RESERVE);
+	// The marker itself may not fit in a tiny budget. Estimate its length with
+	// the largest possible drop count (the whole content) and hard-slice when
+	// even that cannot fit, rather than exceeding the limit.
+	const markerLength = truncationMarker(content.length).length;
+	if (limit <= markerLength) {
+		const kept = safeSliceStart(content, limit);
+		return {
+			content: kept,
+			truncated: true,
+			droppedChars: content.length - kept.length,
+		};
+	}
+
+	const budget = limit - markerLength;
 	const headLength = Math.ceil(budget / 2);
 	const tailLength = budget - headLength;
 
 	let head = content.slice(0, headLength);
 	let tail = tailLength > 0 ? content.slice(content.length - tailLength) : "";
 
-	// Never split a surrogate pair across the cut.
 	if (head.length > 0 && isHighSurrogate(head.charCodeAt(head.length - 1))) {
 		head = head.slice(0, -1);
 	}
@@ -51,7 +78,7 @@ export function budgetContent(
 
 	const droppedChars = content.length - head.length - tail.length;
 	return {
-		content: `${head}\n\n…[truncated ${droppedChars} characters]…\n\n${tail}`,
+		content: `${head}${truncationMarker(droppedChars)}${tail}`,
 		truncated: true,
 		droppedChars,
 	};
@@ -157,10 +184,18 @@ export async function extractStructured(
 	}
 
 	const warnings: string[] = [];
-	const normalized =
-		input.jsonSchema !== undefined
-			? normalizeJsonSchema(input.jsonSchema)
-			: undefined;
+	let normalized: ReturnType<typeof normalizeJsonSchema> | undefined;
+	try {
+		normalized =
+			input.jsonSchema !== undefined
+				? normalizeJsonSchema(input.jsonSchema)
+				: undefined;
+	} catch (error) {
+		return {
+			warning: `schema normalization failed: ${errorMessage(error)}`,
+			attempts: 0,
+		};
+	}
 	if (normalized) warnings.push(...normalized.warnings);
 
 	const budgeted = budgetContent(input.content ?? "", config.maxInputChars);
@@ -173,20 +208,33 @@ export async function extractStructured(
 	const providerOrError = resolveProvider(config, env);
 	if (typeof providerOrError === "string") {
 		return {
-			warning: providerOrError,
+			warning: joinWarning(...warnings, providerOrError),
 			attempts: 0,
 			truncated: budgeted.truncated || undefined,
 		};
 	}
 	const provider = providerOrError;
 
-	const nonce = makeNonce();
-	const messages: ChatMessage[] = buildExtractionMessages({
-		content: budgeted.content,
-		instruction: prompt,
-		jsonSchema: normalized?.schema,
-		nonce,
-	});
+	let nonce = "";
+	let messages: ChatMessage[];
+	try {
+		nonce = makeNonce();
+		messages = buildExtractionMessages({
+			content: budgeted.content,
+			instruction: prompt,
+			jsonSchema: normalized?.schema,
+			nonce,
+		});
+	} catch (error) {
+		return {
+			warning: joinWarning(
+				...warnings,
+				`AI extraction setup failed: ${errorMessage(error)}`,
+			),
+			attempts: 0,
+			truncated: budgeted.truncated || undefined,
+		};
+	}
 
 	const maxAttempts = config.maxRepairs + 1;
 	let attempts = 0;
@@ -245,8 +293,11 @@ export async function extractStructured(
 		}
 
 		if (attempts <= config.maxRepairs) {
-			messages.push({ role: "assistant", content: response.content });
-			messages.push(repairMessage(lastErrors, response.content, nonce));
+			const previous = sanitizeUntrusted(response.content ?? "", nonce);
+			if (previous.trim().length > 0) {
+				messages.push({ role: "assistant", content: previous });
+			}
+			messages.push(repairMessage(lastErrors, previous, nonce));
 		}
 	}
 
@@ -294,14 +345,13 @@ export async function summarize(
 	}
 	const provider = providerOrError;
 
-	const nonce = makeNonce();
-	const messages = buildSummaryMessages({
-		content: budgeted.content,
-		instruction: input.instruction,
-		nonce,
-	});
-
 	try {
+		const nonce = makeNonce();
+		const messages = buildSummaryMessages({
+			content: budgeted.content,
+			instruction: input.instruction,
+			nonce,
+		});
 		const response = await provider.chat({ messages, temperature: 0 });
 		return {
 			summary: (response.content ?? "").trim(),

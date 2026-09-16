@@ -29,17 +29,23 @@ const OPAQUE_KEYWORDS = new Set([
 ]);
 
 const MAX_REF_DEPTH = 10;
+// Structural nesting cap. Pathological schemas (hundreds of thousands of levels
+// deep) must degrade to a warning rather than blow the call stack.
+const MAX_SCHEMA_DEPTH = 100;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function cloneValue(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map((item) => cloneValue(item));
+function cloneValue(value: unknown, depth = 0): unknown {
+	if (depth >= MAX_SCHEMA_DEPTH) return value;
+	if (Array.isArray(value)) {
+		return value.map((item) => cloneValue(item, depth + 1));
+	}
 	if (isPlainObject(value)) {
 		const out: Record<string, unknown> = {};
 		for (const [key, item] of Object.entries(value)) {
-			out[key] = cloneValue(item);
+			out[key] = cloneValue(item, depth + 1);
 		}
 		return out;
 	}
@@ -83,12 +89,25 @@ function isObjectNode(node: Record<string, unknown>): boolean {
 	return Array.isArray(node.type) && node.type.includes("object");
 }
 
+// Native strict structured output expects an object root, so a bare array
+// schema (including `type:["array"]` unions and items-only schemas) is wrapped.
+function isBareArraySchema(schema: Record<string, unknown>): boolean {
+	if (schema.type === "array") return true;
+	if (Array.isArray(schema.type) && schema.type.includes("array")) return true;
+	return (
+		schema.type === undefined &&
+		schema.items !== undefined &&
+		!isObjectNode(schema)
+	);
+}
+
 function normalizeRefNode(
 	node: Record<string, unknown>,
 	root: Record<string, unknown>,
 	refDepth: number,
 	visited: Set<string>,
 	warnings: string[],
+	depth: number,
 ): Record<string, unknown> {
 	const ref = node.$ref as string;
 
@@ -110,11 +129,12 @@ function normalizeRefNode(
 	const nextVisited = new Set(visited);
 	nextVisited.add(ref);
 	return normalizeNode(
-		cloneValue(target),
+		cloneValue(target, depth + 1),
 		root,
 		refDepth + 1,
 		nextVisited,
 		warnings,
+		depth + 1,
 	) as Record<string, unknown>;
 }
 
@@ -124,26 +144,38 @@ function normalizeNode(
 	refDepth: number,
 	visited: Set<string>,
 	warnings: string[],
+	depth: number,
 ): unknown {
+	if (depth >= MAX_SCHEMA_DEPTH) {
+		warnings.push(`schema depth cap reached at ${MAX_SCHEMA_DEPTH}`);
+		return value;
+	}
 	if (Array.isArray(value)) {
 		return value.map((item) =>
-			normalizeNode(item, root, refDepth, visited, warnings),
+			normalizeNode(item, root, refDepth, visited, warnings, depth + 1),
 		);
 	}
 	if (!isPlainObject(value)) return value;
 
 	if (typeof value.$ref === "string") {
-		return normalizeRefNode(value, root, refDepth, visited, warnings);
+		return normalizeRefNode(value, root, refDepth, visited, warnings, depth);
 	}
 
 	const out: Record<string, unknown> = {};
 	for (const [key, child] of Object.entries(value)) {
 		if (UNSUPPORTED_KEYWORDS.has(key)) continue;
 		if (OPAQUE_KEYWORDS.has(key)) {
-			out[key] = cloneValue(child);
+			out[key] = cloneValue(child, depth + 1);
 			continue;
 		}
-		out[key] = normalizeNode(child, root, refDepth, visited, warnings);
+		out[key] = normalizeNode(
+			child,
+			root,
+			refDepth,
+			visited,
+			warnings,
+			depth + 1,
+		);
 	}
 
 	if (isObjectNode(out)) {
@@ -165,15 +197,14 @@ export function normalizeJsonSchema(schema: Record<string, unknown>): {
 
 	// Local `$ref`s are resolved against the original structure, before any
 	// root wrapping moves nodes around.
-	const root: Record<string, unknown> =
-		source.type === "array"
-			? {
-					type: "object",
-					properties: { items: source },
-					required: ["items"],
-					additionalProperties: false,
-				}
-			: source;
+	const root: Record<string, unknown> = isBareArraySchema(source)
+		? {
+				type: "object",
+				properties: { items: source },
+				required: ["items"],
+				additionalProperties: false,
+			}
+		: source;
 
 	const normalized = normalizeNode(
 		root,
@@ -181,6 +212,7 @@ export function normalizeJsonSchema(schema: Record<string, unknown>): {
 		0,
 		new Set(),
 		warnings,
+		0,
 	) as Record<string, unknown>;
 	return { schema: normalized, warnings };
 }
@@ -220,17 +252,32 @@ function matchesType(value: unknown, expected: string): boolean {
 	}
 }
 
+// Order-insensitive structural equality: enum values may be objects whose key
+// order differs from the value being validated.
 function deepEqual(left: unknown, right: unknown): boolean {
 	if (left === right) return true;
 	if (typeof left !== typeof right) return false;
 	if (left === null || right === null) return false;
-	if (typeof left === "object") {
-		try {
-			return JSON.stringify(left) === JSON.stringify(right);
-		} catch {
-			return false;
-		}
+
+	if (Array.isArray(left) || Array.isArray(right)) {
+		if (!Array.isArray(left) || !Array.isArray(right)) return false;
+		if (left.length !== right.length) return false;
+		return left.every((item, index) => deepEqual(item, right[index]));
 	}
+
+	if (typeof left === "object" && typeof right === "object") {
+		const leftRecord = left as Record<string, unknown>;
+		const rightRecord = right as Record<string, unknown>;
+		const leftKeys = Object.keys(leftRecord);
+		const rightKeys = Object.keys(rightRecord);
+		if (leftKeys.length !== rightKeys.length) return false;
+		return leftKeys.every(
+			(key) =>
+				Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+				deepEqual(leftRecord[key], rightRecord[key]),
+		);
+	}
+
 	return false;
 }
 
@@ -284,6 +331,16 @@ function validateNode(
 			for (const [key, child] of Object.entries(schema.properties)) {
 				if (key in value && isPlainObject(child)) {
 					validateNode(value[key], child, `${path}.${key}`, errors);
+				}
+			}
+		}
+		if (schema.additionalProperties === false) {
+			const allowed = isPlainObject(schema.properties)
+				? new Set(Object.keys(schema.properties))
+				: new Set<string>();
+			for (const key of Object.keys(value)) {
+				if (!allowed.has(key)) {
+					errors.push(`${path}.${key}: additional property not allowed`);
 				}
 			}
 		}

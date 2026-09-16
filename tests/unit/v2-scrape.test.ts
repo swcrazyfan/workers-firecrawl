@@ -498,6 +498,8 @@ describe("V2Scrape AI formats", () => {
 		const body = await res.json();
 		expect(body.data.json).toEqual({ price: 3 });
 		expect("warning" in body.data).toBe(false);
+		// markdown is fetched for the pipeline but must not leak into the output.
+		expect("markdown" in body.data).toBe(false);
 		expect(extractStructured).toHaveBeenCalledWith(
 			{
 				content: "# Example Domain",
@@ -547,6 +549,7 @@ describe("V2Scrape AI formats", () => {
 		expect(res.status).toBe(200);
 		const body = await res.json();
 		expect(body.data.summary).toBe("A summary.");
+		expect("markdown" in body.data).toBe(false);
 		expect(summarize).toHaveBeenCalledWith(
 			{ content: "# Example Domain" },
 			env,
