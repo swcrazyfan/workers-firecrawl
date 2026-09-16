@@ -612,6 +612,137 @@ describe("V2Scrape AI formats", () => {
 	});
 });
 
+describe("V2Scrape actions", () => {
+	it("passes executable actions through to the extraction pipeline", async () => {
+		await postScrape({
+			url: "https://example.com",
+			actions: [
+				{ type: "click", selector: "#load-more" },
+				{ type: "wait", milliseconds: 250 },
+				{ type: "screenshot" },
+			],
+		});
+		expect(extractContent).toHaveBeenCalledWith(
+			expect.anything(),
+			"https://example.com",
+			expect.objectContaining({
+				actions: [
+					{ type: "click", selector: "#load-more" },
+					{ type: "wait", milliseconds: 250 },
+					{ type: "screenshot" },
+				],
+			}),
+		);
+	});
+
+	it("filters unimplemented actions out of the pipeline call", async () => {
+		await postScrape({
+			url: "https://example.com",
+			actions: [
+				{ type: "pdf", format: "A4" },
+				{ type: "click", selector: "#a" },
+				{ type: "scrape" },
+			],
+		});
+		expect(extractContent).toHaveBeenCalledWith(
+			expect.anything(),
+			"https://example.com",
+			expect.objectContaining({
+				actions: [{ type: "click", selector: "#a" }],
+			}),
+		);
+	});
+
+	it("maps action screenshots into data.actions.screenshots", async () => {
+		vi.mocked(extractContent).mockResolvedValue({
+			...scrapeResult,
+			actions: { screenshots: ["AAA", "BBB"] },
+		} as never);
+		const res = await postScrape({
+			url: "https://example.com",
+			actions: [{ type: "screenshot", fullPage: true }],
+		});
+		const body = await res.json();
+		expect(body.data.actions).toEqual({ screenshots: ["AAA", "BBB"] });
+	});
+
+	it("falls back to an empty screenshots array", async () => {
+		const res = await postScrape({
+			url: "https://example.com",
+			actions: [{ type: "screenshot" }],
+		});
+		const body = await res.json();
+		expect(body.data.actions).toEqual({ screenshots: [] });
+	});
+
+	it("omits the actions key when no screenshot action was requested", async () => {
+		const res = await postScrape({
+			url: "https://example.com",
+			actions: [{ type: "click", selector: "#a" }],
+		});
+		const body = await res.json();
+		expect("actions" in body.data).toBe(false);
+	});
+
+	it("omits the actions key when no actions were sent", async () => {
+		const res = await postScrape({ url: "https://example.com" });
+		const body = await res.json();
+		expect("actions" in body.data).toBe(false);
+	});
+
+	it("warns for unimplemented actions, deduped and joined", async () => {
+		const res = await postScrape({
+			url: "https://example.com",
+			actions: [
+				{ type: "pdf" },
+				{ type: "pdf", format: "Letter" },
+				{ type: "executeJavascript", script: "1" },
+			],
+		});
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.data.warning).toBe(
+			"action pdf is not supported by this deployment; " +
+				"action executeJavascript is not supported by this deployment",
+		);
+		expect(extractContent).toHaveBeenCalledWith(
+			expect.anything(),
+			"https://example.com",
+			expect.objectContaining({ actions: [] }),
+		);
+	});
+
+	it("joins action warnings with format warnings", async () => {
+		const res = await postScrape({
+			url: "https://example.com",
+			formats: ["images"],
+			actions: [{ type: "scrape" }],
+		});
+		const body = await res.json();
+		expect(body.data.warning).toBe(
+			"format images is not supported by this deployment; " +
+				"action scrape is not supported by this deployment",
+		);
+	});
+
+	it("returns 400 for an unknown action type", async () => {
+		const res = await postScrape({
+			url: "https://example.com",
+			actions: [{ type: "nope" }],
+		});
+		expect(res.status).toBe(400);
+		expect(extractContent).not.toHaveBeenCalled();
+	});
+
+	it("returns 400 for a wait action without milliseconds or selector", async () => {
+		const res = await postScrape({
+			url: "https://example.com",
+			actions: [{ type: "wait" }],
+		});
+		expect(res.status).toBe(400);
+	});
+});
+
 describe("V2Scrape errors", () => {
 	it("returns 400 for an unknown format object", async () => {
 		const res = await postScrape({
