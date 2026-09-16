@@ -1,6 +1,8 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { extractStructured } from "../../src/ai/extract";
 import {
+	ROBOTS_DISALLOWED,
 	createJob,
 	insertResult,
 	setJobStatus,
@@ -10,11 +12,15 @@ import type { Env } from "../../src/index";
 // src/index.ts pulls in puppeteer/node-html-markdown through the v1 routes and
 // the other v2 routes; replace them with trivial chanfana endpoints so the real
 // route table can be exercised in tests. The crawl routes themselves are NOT
-// mocked, and `src/v2/scrape` stays real so the preview resolves defaults
-// through the actual engine formatter.
+// mocked, and `src/v2/scrape` stays real so the preview resolves through the
+// actual schema helpers. The AI pipeline is mocked so no provider is contacted.
 vi.mock("../../src/browser", () => ({
 	getBrowser: vi.fn(),
 	extractContent: vi.fn(),
+}));
+vi.mock("../../src/ai/extract", () => ({
+	extractStructured: vi.fn(),
+	summarize: vi.fn(),
 }));
 vi.mock("../../src/scrape", async () => {
 	const { OpenAPIRoute } = await import("chanfana");
@@ -65,7 +71,43 @@ import app from "../../src/index";
 
 const NOW = 1_700_000_000_000;
 const SEED = "https://example.com";
-const ROBOTS_ERROR = "robots.txt disallowed";
+
+// Engine-default parameters, the documented fallback when generation fails.
+const DEFAULT_PARAMS = {
+	allowExternalLinks: false,
+	allowSubdomains: false,
+	crawlEntireDomain: false,
+	deduplicateSimilarURLs: true,
+	delay: 0,
+	excludePaths: [],
+	ignoreQueryParameters: false,
+	ignoreRobotsTxt: false,
+	includePaths: [],
+	limit: 10000,
+	maxDepth: 10,
+	maxDiscoveryDepth: 10,
+	robotsUserAgent: "",
+	sitemap: "include",
+	url: SEED,
+};
+
+const GENERATED_PARAMS = {
+	allowExternalLinks: true,
+	allowSubdomains: false,
+	crawlEntireDomain: false,
+	deduplicateSimilarURLs: true,
+	delay: 250,
+	excludePaths: ["/logout"],
+	ignoreQueryParameters: true,
+	ignoreRobotsTxt: false,
+	includePaths: ["/blog/.*"],
+	limit: 500,
+	maxDepth: 3,
+	maxDiscoveryDepth: 2,
+	robotsUserAgent: "mybot",
+	sitemap: "include",
+	url: SEED,
+};
 
 interface WorkflowMock {
 	create: ReturnType<typeof vi.fn>;
@@ -102,7 +144,11 @@ function postPreview(body: unknown, testEnv: Env = makeEnv()) {
 
 async function seedJob(
 	id: string,
-	opts?: { status?: Parameters<typeof setJobStatus>[2]; now?: number; expiresAt?: number },
+	opts?: {
+		status?: Parameters<typeof setJobStatus>[2];
+		now?: number;
+		expiresAt?: number;
+	},
 ) {
 	const now = opts?.now ?? NOW;
 	await createJob(env.DB, {
@@ -173,12 +219,12 @@ describe("GET /v2/crawl/:id/errors", () => {
 			`${SEED}/boom-2`,
 			`${SEED}/boom-1`,
 		]);
+		// The contract types `id` as a string even though D1 stores an integer.
+		expect(typeof body.errors[0].id).toBe("string");
+		expect(body.errors[0].id).toMatch(/^\d+$/);
 		// Timestamps are ISO-8601 date-time strings, not epoch millis.
-		expect(body.errors[0].timestamp).toBe(
-			new Date(NOW + 4).toISOString(),
-		);
+		expect(body.errors[0].timestamp).toBe(new Date(NOW + 4).toISOString());
 		expect(body.errors[0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-		expect(body.errors[0].id).toEqual(expect.any(Number));
 		expect(body.robotsBlocked).toEqual([]);
 	});
 
@@ -188,7 +234,7 @@ describe("GET /v2/crawl/:id/errors", () => {
 			jobId: "job-robots",
 			url: `${SEED}/blocked`,
 			status: "failed",
-			error: ROBOTS_ERROR,
+			error: ROBOTS_DISALLOWED,
 			now: NOW + 1,
 		});
 		await insertResult(env.DB, {
@@ -209,9 +255,25 @@ describe("GET /v2/crawl/:id/errors", () => {
 		expect(
 			body.errors.some(
 				(item: { url: string; error: string }) =>
-					item.url === `${SEED}/blocked` && item.error === ROBOTS_ERROR,
+					item.url === `${SEED}/blocked` && item.error === ROBOTS_DISALLOWED,
 			),
 		).toBe(true);
+	});
+
+	it("ignores non-failed rows that happen to carry the robots error", async () => {
+		await seedJob("job-robots-status");
+		await insertResult(env.DB, {
+			jobId: "job-robots-status",
+			url: `${SEED}/not-failed`,
+			status: "completed",
+			error: ROBOTS_DISALLOWED,
+			now: NOW + 1,
+		});
+		const body = await (
+			await get("/v2/crawl/job-robots-status/errors")
+		).json();
+		expect(body.errors).toEqual([]);
+		expect(body.robotsBlocked).toEqual([]);
 	});
 
 	it("deduplicates the robotsBlocked list", async () => {
@@ -221,7 +283,7 @@ describe("GET /v2/crawl/:id/errors", () => {
 				jobId: "job-robots-dup",
 				url: `${SEED}/blocked`,
 				status: "failed",
-				error: ROBOTS_ERROR,
+				error: ROBOTS_DISALLOWED,
 				now,
 			});
 		}
@@ -314,11 +376,15 @@ describe("GET /v2/crawl/active", () => {
 			"active-new",
 		]);
 		expect(body.crawls[0]).toMatchObject({
+			// Required by the contract; a documented self-hosted placeholder.
+			teamId: "self-hosted",
 			status: "scraping",
 			url: `${SEED}/active-old`,
 			total: 0,
 			completed: 0,
 		});
+		// `options` is intentionally not exposed (it can carry a webhook URL).
+		expect(body.crawls[0]).not.toHaveProperty("options");
 		expect(body.crawls[0].createdAt).toBe(new Date(now - 2000).toISOString());
 	});
 
@@ -346,34 +412,122 @@ describe("GET /v2/crawl/active", () => {
 			`${SEED}/a-2`,
 		]);
 	});
+
+	it("rejects an out-of-range limit", async () => {
+		expect((await get("/v2/crawl/active?limit=0")).status).toBe(400);
+		expect((await get("/v2/crawl/active?limit=5000")).status).toBe(400);
+	});
 });
 
 describe("POST /v2/crawl/params-preview", () => {
-	it("resolves the engine defaults without side effects", async () => {
-		const workflow = workflowMock();
-		const res = await postPreview({ url: SEED }, makeEnv(workflow));
-		expect(res.status).toBe(200);
-
-		const body = await res.json();
-		expect(body.success).toBe(true);
-		expect(body.warning).toBe("params-preview does not verify reachability");
-		expect(body.data).toEqual({
-			url: SEED,
-			limit: 10000,
-			maxDiscoveryDepth: 10,
-			allowExternalLinks: false,
-			allowSubdomains: false,
-			includePaths: [],
-			excludePaths: [],
-			ignoreRobotsTxt: false,
-			sitemap: "include",
-			scrapeFormats: ["markdown"],
-			ignoredFields: [],
+	it("returns parameters generated from the prompt, validated and normalised", async () => {
+		vi.mocked(extractStructured).mockResolvedValue({
+			data: GENERATED_PARAMS,
+			attempts: 1,
+			model: "test-model",
 		});
 
-		// Pure preview: no job row, no queue writes, no workflow call.
+		const res = await postPreview({
+			url: SEED,
+			prompt: "crawl only the blog and allow external links",
+		});
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.success).toBe(true);
+		expect(body.data).toEqual(GENERATED_PARAMS);
+		expect(body.warning).toBeUndefined();
+
+		// The model sees the URL and the user prompt; nothing is fetched.
+		expect(extractStructured).toHaveBeenCalledTimes(1);
+		const [input] = vi.mocked(extractStructured).mock.calls[0];
+		expect(input.content).toContain(SEED);
+		expect(input.content).toContain("crawl only the blog");
+		expect(input.prompt).toContain(SEED);
+		expect(input.prompt).toContain("crawl only the blog");
+		expect(input.jsonSchema).toBeDefined();
+	});
+
+	it("clamps out-of-range generated values to legal ranges", async () => {
+		vi.mocked(extractStructured).mockResolvedValue({
+			data: {
+				...GENERATED_PARAMS,
+				limit: 999999,
+				maxDepth: 500,
+				maxDiscoveryDepth: 500,
+				sitemap: "only",
+				delay: 12.9,
+			},
+			attempts: 1,
+		});
+
+		const body = await (await postPreview({ url: SEED, prompt: "everything" }))
+			.json();
+		expect(body.data).toMatchObject({
+			limit: 100000,
+			maxDepth: 10,
+			maxDiscoveryDepth: 10,
+			sitemap: "only",
+			delay: 12,
+		});
+	});
+
+	it("falls back to engine defaults with a warning when generation produces no data", async () => {
+		vi.mocked(extractStructured).mockResolvedValue({
+			warning: "AI not configured: no AI provider configured",
+			attempts: 0,
+		});
+
+		const res = await postPreview({ url: SEED, prompt: "crawl the docs" });
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.success).toBe(true);
+		expect(body.data).toEqual(DEFAULT_PARAMS);
+		expect(body.warning).toContain("engine default");
+		expect(body.warning).toContain("AI not configured");
+	});
+
+	it("falls back to engine defaults when the generated values fail validation", async () => {
+		// A partial/unsafe result must not be returned as if it were generated.
+		vi.mocked(extractStructured).mockResolvedValue({
+			data: { limit: 5, url: SEED },
+			attempts: 1,
+		});
+
+		const res = await postPreview({ url: SEED, prompt: "crawl the docs" });
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.data).toEqual(DEFAULT_PARAMS);
+		expect(body.warning).toContain("engine default");
+	});
+
+	it("never throws when the AI pipeline rejects", async () => {
+		vi.mocked(extractStructured).mockRejectedValue(new Error("provider down"));
+
+		const res = await postPreview({ url: SEED, prompt: "crawl the docs" });
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.data).toEqual(DEFAULT_PARAMS);
+		expect(body.warning).toContain("engine default");
+	});
+
+	it("is a pure preview: no job, no enqueue, no workflow, no outbound fetch", async () => {
+		const workflow = workflowMock();
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		vi.mocked(extractStructured).mockResolvedValue({
+			data: GENERATED_PARAMS,
+			attempts: 1,
+		});
+
+		const res = await postPreview(
+			{ url: SEED, prompt: "crawl the blog" },
+			makeEnv(workflow),
+		);
+		expect(res.status).toBe(200);
+
 		expect(workflow.create).not.toHaveBeenCalled();
 		expect(workflow.get).not.toHaveBeenCalled();
+		expect(fetchSpy).not.toHaveBeenCalled();
+
 		const jobs = await env.DB.prepare(
 			"SELECT COUNT(*) AS count FROM crawl_jobs",
 		).first<{ count: number }>();
@@ -382,59 +536,26 @@ describe("POST /v2/crawl/params-preview", () => {
 			"SELECT COUNT(*) AS count FROM crawl_queue",
 		).first<{ count: number }>();
 		expect(queue.count).toBe(0);
+
+		fetchSpy.mockRestore();
 	});
 
-	it("echoes supplied parameters through the engine resolver", async () => {
-		const res = await postPreview({
-			url: SEED,
-			limit: 5,
-			maxDiscoveryDepth: 2,
-			allowExternalLinks: true,
-			allowSubdomains: true,
-			includePaths: ["/blog/.*"],
-			excludePaths: ["/admin/.*"],
-			ignoreRobotsTxt: true,
-			sitemap: "only",
-			scrapeOptions: { formats: ["html"] },
-		});
-		expect(res.status).toBe(200);
-		const body = await res.json();
-		expect(body.data).toMatchObject({
-			url: SEED,
-			limit: 5,
-			maxDiscoveryDepth: 2,
-			allowExternalLinks: true,
-			allowSubdomains: true,
-			includePaths: ["/blog/.*"],
-			excludePaths: ["/admin/.*"],
-			ignoreRobotsTxt: true,
-			sitemap: "only",
-			scrapeFormats: ["html"],
-			ignoredFields: [],
-		});
+	it("returns 400 for a missing or invalid body", async () => {
+		// `prompt` is required.
+		expect((await postPreview({ url: SEED })).status).toBe(400);
+		expect((await postPreview({ prompt: "crawl the blog" })).status).toBe(400);
+		expect(
+			(await postPreview({ url: "not a url", prompt: "crawl" })).status,
+		).toBe(400);
 	});
 
-	it("lists accepted-and-ignored fields, including scrapeOptions sub-fields", async () => {
-		const res = await postPreview({
-			url: SEED,
-			maxConcurrency: 3,
-			delay: 1,
-			ignoreQueryParameters: true,
-			scrapeOptions: { formats: ["markdown"], onlyMainContent: true },
-		});
-		expect(res.status).toBe(200);
-		const body = await res.json();
-		expect(body.data.ignoredFields).toEqual([
-			"delay",
-			"ignoreQueryParameters",
-			"maxConcurrency",
-			"scrapeOptions.onlyMainContent",
-		]);
-	});
-
-	it("returns 400 for an invalid body", async () => {
-		expect((await postPreview({})).status).toBe(400);
-		expect((await postPreview({ url: "not a url" })).status).toBe(400);
+	it("returns 400 for a prompt longer than 10000 characters", async () => {
+		expect(
+			(await postPreview({ url: SEED, prompt: "a".repeat(10001) })).status,
+		).toBe(400);
+		expect(
+			(await postPreview({ url: SEED, prompt: "a".repeat(10000) })).status,
+		).toBe(200);
 	});
 });
 
@@ -478,9 +599,13 @@ describe("crawl extras routing", () => {
 	});
 
 	it("routes POST /v2/crawl/params-preview to the preview handler", async () => {
-		const res = await postPreview({ url: SEED });
+		vi.mocked(extractStructured).mockResolvedValue({
+			data: GENERATED_PARAMS,
+			attempts: 1,
+		});
+		const res = await postPreview({ url: SEED, prompt: "crawl the blog" });
 		expect(res.status).toBe(200);
 		const body = await res.json();
-		expect(body.data.limit).toBe(10000);
+		expect(body.data.limit).toBe(500);
 	});
 });

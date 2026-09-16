@@ -25,7 +25,6 @@ import { extractContent, getBrowser } from "../../src/browser";
 import {
 	type CrawlBatch,
 	type CrawlOptions,
-	ROBOTS_DISALLOWED,
 	buildTerminalPayload,
 	decideTerminalStatus,
 	filterDiscoveredLinks,
@@ -40,6 +39,7 @@ import {
 } from "../../src/crawler/engine";
 import { CRAWL_USER_AGENT, fetchRobots } from "../../src/crawler/robots";
 import {
+	ROBOTS_DISALLOWED,
 	bumpJobCounters,
 	claimNextBatch,
 	createJob,

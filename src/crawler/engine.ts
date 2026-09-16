@@ -18,6 +18,7 @@ import {
 import { fetchSitemapUrls } from "./sitemap";
 import {
 	type CrawlStatus,
+	ROBOTS_DISALLOWED,
 	bumpJobCounters,
 	claimNextBatch,
 	enqueueUrls,
@@ -108,7 +109,6 @@ const TERMINAL_PAGE_SIZE = 50;
 const SITEMAP_MAX_FILES = 20;
 const SITEMAP_TIMEOUT_MS = 5000;
 
-export const ROBOTS_DISALLOWED = "robots.txt disallowed";
 const SUMMARY_UNSUPPORTED =
 	"summary format is not supported by crawl and was ignored";
 
