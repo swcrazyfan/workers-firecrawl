@@ -57,6 +57,19 @@ vi.mock("../../src/webSearch", async () => {
 		},
 	};
 });
+// /v2/scrape also lives in the route table and pulls the browser module; stub
+// it the same way as the v1 routes so importing src/index.ts stays browser-free.
+vi.mock("../../src/v2/scrape", async () => {
+	const { OpenAPIRoute } = await import("chanfana");
+	return {
+		V2Scrape: class extends OpenAPIRoute {
+			schema = {};
+			async handle() {
+				return { success: true, data: {} };
+			}
+		},
+	};
+});
 
 import app from "../../src/index";
 
