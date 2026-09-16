@@ -3,9 +3,10 @@ import { z } from "zod";
 import { extractStructured, summarize } from "../ai/extract";
 import { extractContent, getBrowser } from "../browser";
 import type { AppContext } from "../index";
+import { filterExecutableActions, scrapeActionSchema } from "../scrapeActions";
 
 // Accepted-and-ignored request fields (validated for SDK compatibility but not
-// wired to the extraction pipeline yet): actions, location, proxy, maxAge,
+// wired to the extraction pipeline yet): location, proxy, maxAge,
 // minAge, storeInCache, parsers, profile, lockdown, redactPII,
 // zeroDataRetention, threatProtection, auditMetadata, skipTlsVerification.
 // `includeTags`/`excludeTags`, `mobile`, `removeBase64Images` and `blockAds`
@@ -13,7 +14,9 @@ import type { AppContext } from "../index";
 //
 // Formats this deployment does not implement are accepted and reported through
 // `data.warning` (see UNIMPLEMENTED_FORMATS) rather than rejected, matching the
-// SDK compatibility contract.
+// SDK compatibility contract. The `actions` array is executed on the page
+// (spec 016): wait/click/write/press/scroll/screenshot run before format
+// extraction, pdf/executeJavascript/scrape warn as unimplemented.
 
 export class FormatValidationError extends Error {
 	constructor(message: string) {
@@ -237,6 +240,7 @@ export class V2Scrape extends OpenAPIRoute {
 							mobile: z.boolean().optional(),
 							removeBase64Images: z.boolean().optional(),
 							blockAds: z.boolean().optional(),
+							actions: z.array(scrapeActionSchema).optional(),
 						}),
 					},
 				},
@@ -255,6 +259,11 @@ export class V2Scrape extends OpenAPIRoute {
 						screenshot: z.string().nullable().optional(),
 						summary: z.string().optional(),
 						json: z.unknown().optional(),
+						actions: z
+							.object({
+								screenshots: z.string().array(),
+							})
+							.optional(),
 						metadata: z.object({
 							title: z.string(),
 							description: z.string(),
@@ -299,6 +308,12 @@ export class V2Scrape extends OpenAPIRoute {
 		if (normalized.screenshotOptionsIgnored) {
 			warnings.push("screenshot quality/viewport options are ignored");
 		}
+
+		const actionPlan = filterExecutableActions(body.actions);
+		warnings.push(...actionPlan.warnings);
+		const wantsActionScreenshots = actionPlan.executable.some(
+			(action) => action.type === "screenshot",
+		);
 
 		// `extractContent` still speaks the v1 format vocabulary; translate the
 		// v2 screenshot object into the legacy full-page marker it understands.
@@ -345,6 +360,7 @@ export class V2Scrape extends OpenAPIRoute {
 					waitFor: body.waitFor,
 					timeout: body.timeout ?? 60000,
 					headers: body.headers,
+					actions: actionPlan.executable,
 				});
 			} catch (error) {
 				console.error(
@@ -377,6 +393,11 @@ export class V2Scrape extends OpenAPIRoute {
 			}
 			if (normalized.strings.includes("screenshot")) {
 				responseData.screenshot = result.screenshot;
+			}
+			if (wantsActionScreenshots) {
+				responseData.actions = {
+					screenshots: result.actions?.screenshots ?? [],
+				};
 			}
 
 			// AI formats degrade to a warning on a still-200 response; the

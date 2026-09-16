@@ -1,6 +1,7 @@
 import puppeteer, { type Browser } from "@cloudflare/puppeteer";
 import { NodeHtmlMarkdown } from "node-html-markdown";
 import type { Env } from "./index";
+import { type ExecutableAction, runScrapeActions } from "./scrapeActions";
 
 export interface ExtractOptions {
 	formats?: string[];
@@ -8,6 +9,7 @@ export interface ExtractOptions {
 	waitFor?: number;
 	timeout?: number;
 	headers?: Record<string, string>;
+	actions?: ExecutableAction[];
 }
 
 export async function getBrowser(env: Env): Promise<Browser> {
@@ -24,6 +26,7 @@ export async function extractContent(
 	const waitFor = options?.waitFor;
 	const timeout = options?.timeout;
 	const headers = options?.headers;
+	const actions = options?.actions;
 
 	const page = await browser.newPage();
 	try {
@@ -52,6 +55,17 @@ export async function extractContent(
 		await page.waitForTimeout(1000); // Allow popups to close
 		if (waitFor) {
 			await page.waitForTimeout(waitFor);
+		}
+
+		// v2 scrape actions: after load, before any format extraction, so the
+		// formats observe the post-action DOM. Only screenshot actions yield
+		// output. /v1 callers never pass `actions`.
+		let actionScreenshots: string[] | undefined;
+		if (actions !== undefined && actions.length > 0) {
+			const actionResult = await runScrapeActions(page, actions, { timeout });
+			if (actions.some((action) => action.type === "screenshot")) {
+				actionScreenshots = actionResult.screenshots;
+			}
 		}
 
 		// Extract title, description, and main content
@@ -125,6 +139,9 @@ export async function extractContent(
 			rawHtml: rawHtml,
 			links: links,
 			screenshot: screenshot,
+			...(actionScreenshots !== undefined && {
+				actions: { screenshots: actionScreenshots },
+			}),
 			metadata: {
 				title: title,
 				description: description,
