@@ -126,7 +126,23 @@ describe("WorkersAiProvider.chat", () => {
 		},
 	);
 
-	it("normalizes a nested usage object", async () => {
+	it("normalizes prompt/completion usage and ignores other token keys", async () => {
+		const run = vi.fn().mockResolvedValue({
+			response: "ok",
+			usage: {
+				prompt_tokens: 3,
+				completion_tokens: 7,
+				input_tokens: 99,
+				output_tokens: 99,
+			},
+		});
+		const provider = new WorkersAiProvider(makeConfig(), makeEnv(run));
+		const result = await provider.chat(userMessage);
+
+		expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 7 });
+	});
+
+	it("does not map OpenAI Responses-style input_tokens/output_tokens", async () => {
 		const run = vi.fn().mockResolvedValue({
 			response: "ok",
 			usage: { input_tokens: 3, output_tokens: 7 },
@@ -134,7 +150,18 @@ describe("WorkersAiProvider.chat", () => {
 		const provider = new WorkersAiProvider(makeConfig(), makeEnv(run));
 		const result = await provider.chat(userMessage);
 
-		expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 7 });
+		expect(result.usage).toBeUndefined();
+	});
+
+	it("keeps parsed and blanks content when the response cannot be serialized", async () => {
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		const run = vi.fn().mockResolvedValue({ response: cyclic });
+		const provider = new WorkersAiProvider(makeConfig(), makeEnv(run));
+		const result = await provider.chat(userMessage);
+
+		expect(result.parsed).toBe(cyclic);
+		expect(result.content).toBe("");
 	});
 
 	it("tolerates an absent usage object", async () => {
@@ -184,14 +211,97 @@ describe("WorkersAiProvider.chat", () => {
 		expect(run).toHaveBeenCalledTimes(1);
 	});
 
-	it("prefixes other binding errors", async () => {
+	it("classifies a non-Error JSON mode rejection and retries (auto)", async () => {
+		const run = vi
+			.fn()
+			.mockRejectedValueOnce("JSON Mode couldn't be met")
+			.mockResolvedValueOnce({ response: "{}" });
+		const provider = new WorkersAiProvider(
+			makeConfig({ strictJson: "auto" }),
+			makeEnv(run),
+		);
+		const result = await provider.chat({
+			...userMessage,
+			jsonSchema: { type: "object" },
+		});
+
+		expect(run).toHaveBeenCalledTimes(2);
+		expect(run.mock.calls[1][1].response_format).toBeUndefined();
+		expect(result.content).toBe("{}");
+	});
+
+	it("retries once on a transient binding error, then succeeds", async () => {
+		const run = vi
+			.fn()
+			.mockRejectedValueOnce(new Error("capacity exceeded"))
+			.mockResolvedValueOnce({ response: "recovered" });
+		const provider = new WorkersAiProvider(makeConfig(), makeEnv(run));
+		const result = await provider.chat(userMessage);
+
+		expect(run).toHaveBeenCalledTimes(2);
+		expect(result.content).toBe("recovered");
+	});
+
+	it("gives up after a single transient retry and prefixes the error", async () => {
 		const run = vi.fn().mockRejectedValue(new Error("capacity exceeded"));
 		const provider = new WorkersAiProvider(makeConfig(), makeEnv(run));
 
 		await expect(provider.chat(userMessage)).rejects.toThrow(
 			"workers-ai: capacity exceeded",
 		);
+		expect(run).toHaveBeenCalledTimes(2);
+	});
+
+	it("never retries an AiConfigError and rethrows it as-is", async () => {
+		const run = vi.fn().mockRejectedValue(new AiConfigError("bad binding"));
+		const provider = new WorkersAiProvider(makeConfig(), makeEnv(run));
+
+		const error = await provider.chat(userMessage).catch((caught) => caught);
+		expect(error).toBeInstanceOf(AiConfigError);
+		expect((error as Error).message).toBe("bad binding");
 		expect(run).toHaveBeenCalledTimes(1);
+	});
+
+	it("handles a synchronous throw from the binding and clears the timer", async () => {
+		const run = vi.fn(() => {
+			throw new Error("sync boom");
+		});
+		const provider = new WorkersAiProvider(
+			makeConfig({ timeoutMs: 20000 }),
+			makeEnv(run),
+		);
+
+		vi.useFakeTimers();
+		try {
+			await expect(provider.chat(userMessage)).rejects.toThrow(
+				"workers-ai: sync boom",
+			);
+			expect(run).toHaveBeenCalledTimes(2);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("uses json_object under strictJson off with a schema, else omits it", async () => {
+		const run = vi.fn().mockResolvedValue({ response: "ok" });
+		const provider = new WorkersAiProvider(
+			makeConfig({ strictJson: "off" }),
+			makeEnv(run),
+		);
+
+		const result = await provider.chat({
+			...userMessage,
+			jsonSchema: { type: "object" },
+		});
+		expect(run.mock.calls[0][1].response_format).toEqual({
+			type: "json_object",
+		});
+		expect(result.strictJson).toBe(false);
+
+		run.mockClear();
+		await provider.chat(userMessage);
+		expect(run.mock.calls[0][1].response_format).toBeUndefined();
 	});
 
 	it("rejects with a timeout when run never resolves", async () => {
@@ -207,8 +317,9 @@ describe("WorkersAiProvider.chat", () => {
 			const assertion = expect(promise).rejects.toThrow(
 				"workers-ai: timeout after 20000ms",
 			);
-			await vi.advanceTimersByTimeAsync(20000);
+			await vi.runAllTimersAsync();
 			await assertion;
+			expect(run).toHaveBeenCalledTimes(2);
 		} finally {
 			vi.useRealTimers();
 		}

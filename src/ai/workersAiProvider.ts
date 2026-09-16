@@ -53,10 +53,9 @@ function normalizeUsage(source: unknown): ChatUsage | undefined {
 		record.usage && typeof record.usage === "object"
 			? (record.usage as Record<string, unknown>)
 			: record;
-	const inputTokens = toTokenCount(usage.prompt_tokens ?? usage.input_tokens);
-	const outputTokens = toTokenCount(
-		usage.completion_tokens ?? usage.output_tokens,
-	);
+	// Workers AI text generation reports OpenAI-style prompt/completion tokens.
+	const inputTokens = toTokenCount(usage.prompt_tokens);
+	const outputTokens = toTokenCount(usage.completion_tokens);
 
 	if (inputTokens === undefined && outputTokens === undefined) {
 		return undefined;
@@ -67,6 +66,15 @@ function normalizeUsage(source: unknown): ChatUsage | undefined {
 
 function unexpectedShape(): Error {
 	return new Error("ai: unexpected response shape from workers-ai");
+}
+
+function stringifyParsed(response: object): string {
+	try {
+		return JSON.stringify(response) ?? "";
+	} catch {
+		// A cyclic / non-serializable payload must not escape un-prefixed.
+		return "";
+	}
 }
 
 function normalizeResponse(raw: unknown): NormalizedResponse {
@@ -88,15 +96,35 @@ function normalizeResponse(raw: unknown): NormalizedResponse {
 		}
 
 		if (response && typeof response === "object") {
-			return { content: JSON.stringify(response), parsed: response, usage };
+			return { content: stringifyParsed(response), parsed: response, usage };
 		}
 	}
 
 	throw unexpectedShape();
 }
 
+// Rejections from the binding are not necessarily Error instances; stringify
+// unknown values so the JSON-mode classifier and the error prefix still work.
+function errorText(error: unknown): string {
+	if (error instanceof Error) {
+		return error.message;
+	}
+	if (typeof error === "string") {
+		return error;
+	}
+	try {
+		return JSON.stringify(error) ?? String(error);
+	} catch {
+		return String(error);
+	}
+}
+
+function isJsonModeError(error: unknown): boolean {
+	return /json mode/i.test(errorText(error));
+}
+
 function prefixWorkersAiError(error: unknown): Error {
-	const message = error instanceof Error ? error.message : String(error);
+	const message = errorText(error);
 	if (message.startsWith("workers-ai: ")) {
 		return error instanceof Error ? error : new Error(message);
 	}
@@ -120,6 +148,19 @@ export class WorkersAiProvider implements AiProvider {
 		this.binding = binding;
 	}
 
+	// The binding exposes no HTTP status or Retry-After, so the retry policy
+	// classifies on the error type/message instead, mirroring the OpenAI
+	// provider: config errors are deterministic and never retried, JSON-mode
+	// failures have their own single schema-stripped fallback, and everything
+	// else is treated as a transient binding/runtime failure worth exactly one
+	// retry (immediate — there is no server-provided backoff hint).
+	private isTransient(error: unknown): boolean {
+		if (error instanceof AiConfigError) {
+			return false;
+		}
+		return !isJsonModeError(error);
+	}
+
 	async chat(req: ChatRequest): Promise<ChatResponse> {
 		const hasSchema = Boolean(req.jsonSchema);
 		let strictJson = hasSchema && this.config.strictJson !== "off";
@@ -128,26 +169,34 @@ export class WorkersAiProvider implements AiProvider {
 		try {
 			raw = await this.runWithTimeout(buildWorkersAiInput(req, strictJson));
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			const isJsonModeError = /json mode/i.test(message);
+			if (error instanceof AiConfigError) {
+				throw error;
+			}
 
-			if (hasSchema && isJsonModeError && this.config.strictJson === "auto") {
-				strictJson = false;
-				const retryInput = buildWorkersAiInput(
-					{ ...req, jsonSchema: undefined },
-					false,
-				);
+			if (hasSchema && isJsonModeError(error)) {
+				if (this.config.strictJson === "auto") {
+					strictJson = false;
+					const retryInput = buildWorkersAiInput(
+						{ ...req, jsonSchema: undefined },
+						false,
+					);
+					try {
+						raw = await this.runWithTimeout(retryInput);
+					} catch (retryError) {
+						throw prefixWorkersAiError(retryError);
+					}
+				} else {
+					// "on" surfaces the failure; "off" never used a strict shape.
+					throw this.config.strictJson === "on"
+						? error
+						: prefixWorkersAiError(error);
+				}
+			} else if (this.isTransient(error)) {
 				try {
-					raw = await this.runWithTimeout(retryInput);
+					raw = await this.runWithTimeout(buildWorkersAiInput(req, strictJson));
 				} catch (retryError) {
 					throw prefixWorkersAiError(retryError);
 				}
-			} else if (
-				hasSchema &&
-				isJsonModeError &&
-				this.config.strictJson === "on"
-			) {
-				throw error;
 			} else {
 				throw prefixWorkersAiError(error);
 			}
@@ -175,7 +224,17 @@ export class WorkersAiProvider implements AiProvider {
 				reject(new Error(`workers-ai: timeout after ${timeoutMs}ms`));
 			}, timeoutMs);
 
-			this.binding.run(this.config.model, input).then(
+			let pending: Promise<unknown>;
+			try {
+				pending = Promise.resolve(this.binding.run(this.config.model, input));
+			} catch (error) {
+				// A synchronous throw must still clear the timer.
+				clearTimeout(timer);
+				reject(error);
+				return;
+			}
+
+			pending.then(
 				(value) => {
 					clearTimeout(timer);
 					resolve(value);
