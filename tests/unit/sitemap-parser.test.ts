@@ -52,6 +52,10 @@ function stubFetch(routes: Record<string, Route>) {
 	return mock;
 }
 
+function fetchedUrls(mock: ReturnType<typeof stubFetch>): string[] {
+	return mock.mock.calls.map((call) => call[0] as string);
+}
+
 afterEach(() => {
 	vi.unstubAllGlobals();
 });
@@ -71,7 +75,7 @@ describe("fetchSitemapUrls", () => {
 
 		expect(urls).toEqual(["https://example.com/a", "https://example.com/b"]);
 		// Default /sitemap.xml is only a fallback once robots lists nothing.
-		expect(fetchMock).not.toHaveBeenCalledWith(
+		expect(fetchedUrls(fetchMock)).not.toContain(
 			"https://example.com/sitemap.xml",
 		);
 	});
@@ -101,7 +105,7 @@ describe("fetchSitemapUrls", () => {
 		expect(await fetchSitemapUrls("https://example.com")).toEqual([
 			"https://example.com/from-default",
 		]);
-		expect(fetchMock).toHaveBeenCalledWith("https://example.com/sitemap.xml");
+		expect(fetchedUrls(fetchMock)).toContain("https://example.com/sitemap.xml");
 	});
 
 	it("resolves relative Sitemap directives and relative <loc> values", async () => {
@@ -145,7 +149,7 @@ describe("fetchSitemapUrls", () => {
 			"https://example.com/two",
 			"https://example.com/three",
 		]);
-		expect(fetchMock).toHaveBeenCalledWith("https://example.com/child-2.xml");
+		expect(fetchedUrls(fetchMock)).toContain("https://example.com/child-2.xml");
 	});
 
 	it("stops recursing once maxDepth is reached", async () => {
@@ -167,7 +171,7 @@ describe("fetchSitemapUrls", () => {
 		expect(
 			await fetchSitemapUrls("https://example.com", { maxDepth: 1 }),
 		).toEqual([]);
-		expect(fetchMock).not.toHaveBeenCalledWith("https://example.com/leaf.xml");
+		expect(fetchedUrls(fetchMock)).not.toContain("https://example.com/leaf.xml");
 	});
 
 	it("decompresses gzipped sitemaps via DecompressionStream", async () => {
@@ -304,6 +308,145 @@ describe("fetchSitemapUrls", () => {
 		expect(await fetchSitemapUrls("https://example.com")).toEqual([
 			"https://example.com/survivor",
 		]);
+	});
+
+	it("is case-insensitive and ignores commented-out Sitemap lines", async () => {
+		const fetchMock = stubFetch({
+			"https://example.com/robots.txt": new Response(
+				[
+					"# Sitemap: https://example.com/commented.xml",
+					"SITEMAP: https://example.com/upper.xml",
+					"sitemap: https://example.com/inline.xml # trailing note",
+				].join("\n"),
+			),
+			"https://example.com/upper.xml": xmlResponse(
+				urlset("https://example.com/upper"),
+			),
+			"https://example.com/inline.xml": xmlResponse(
+				urlset("https://example.com/inline"),
+			),
+		});
+
+		expect(await fetchSitemapUrls("https://example.com")).toEqual([
+			"https://example.com/upper",
+			"https://example.com/inline",
+		]);
+		expect(fetchedUrls(fetchMock)).not.toContain(
+			"https://example.com/commented.xml",
+		);
+	});
+
+	it("decodes named and numeric XML entities", async () => {
+		stubFetch({
+			"https://example.com/robots.txt": new Response(
+				"Sitemap: https://example.com/sitemap.xml\n",
+			),
+			"https://example.com/sitemap.xml": xmlResponse(
+				urlset(
+					"https://example.com/a?x=1&amp;y=2",
+					"https://example.com/b?x=1&#38;y=2",
+					"https://example.com/c?x=1&#x26;y=2",
+				),
+			),
+		});
+
+		expect(await fetchSitemapUrls("https://example.com")).toEqual([
+			"https://example.com/a?x=1&y=2",
+			"https://example.com/b?x=1&y=2",
+			"https://example.com/c?x=1&y=2",
+		]);
+	});
+
+	it("terminates on a self-referencing sitemap index", async () => {
+		const fetchMock = stubFetch({
+			"https://example.com/robots.txt": new Response(
+				"Sitemap: https://example.com/self.xml\n",
+			),
+			"https://example.com/self.xml": xmlResponse(
+				sitemapIndex("https://example.com/self.xml"),
+			),
+		});
+
+		expect(await fetchSitemapUrls("https://example.com")).toEqual([]);
+		const selfFetches = fetchMock.mock.calls.filter(
+			(call) => call[0] === "https://example.com/self.xml",
+		);
+		expect(selfFetches).toHaveLength(1);
+	});
+
+	it("caps collected URLs across multiple sitemap files", async () => {
+		const fetchMock = stubFetch({
+			"https://example.com/robots.txt": new Response(
+				"Sitemap: https://example.com/a.xml\nSitemap: https://example.com/b.xml\n",
+			),
+			"https://example.com/a.xml": xmlResponse(
+				urlset(
+					"https://example.com/1",
+					"https://example.com/2",
+					"https://example.com/3",
+				),
+			),
+			"https://example.com/b.xml": xmlResponse(
+				urlset(
+					"https://example.com/4",
+					"https://example.com/5",
+					"https://example.com/6",
+				),
+			),
+		});
+
+		expect(
+			await fetchSitemapUrls("https://example.com", { limit: 4 }),
+		).toEqual([
+			"https://example.com/1",
+			"https://example.com/2",
+			"https://example.com/3",
+			"https://example.com/4",
+		]);
+		expect(fetchedUrls(fetchMock)).toContain("https://example.com/b.xml");
+	});
+
+	it("caps the number of sitemap files fetched", async () => {
+		const children = ["one.xml", "two.xml", "three.xml"].map(
+			(name) => `https://example.com/${name}`,
+		);
+		const fetchMock = stubFetch({
+			"https://example.com/robots.txt": new Response(
+				"Sitemap: https://example.com/root.xml\n",
+			),
+			"https://example.com/root.xml": xmlResponse(sitemapIndex(...children)),
+			"https://example.com/one.xml": xmlResponse(
+				urlset("https://example.com/one"),
+			),
+			"https://example.com/two.xml": xmlResponse(
+				urlset("https://example.com/two"),
+			),
+			"https://example.com/three.xml": xmlResponse(
+				urlset("https://example.com/three"),
+			),
+		});
+
+		// root.xml is file 1, one.xml is file 2; the cap stops the rest.
+		expect(
+			await fetchSitemapUrls("https://example.com", { maxFiles: 2 }),
+		).toEqual(["https://example.com/one"]);
+		expect(fetchedUrls(fetchMock)).not.toContain("https://example.com/two.xml");
+	});
+
+	it("requests each sitemap with an abort signal", async () => {
+		const fetchMock = stubFetch({
+			"https://example.com/robots.txt": new Response(
+				"Sitemap: https://example.com/sitemap.xml\n",
+			),
+			"https://example.com/sitemap.xml": xmlResponse(
+				urlset("https://example.com/a"),
+			),
+		});
+
+		await fetchSitemapUrls("https://example.com", { timeoutMs: 1234 });
+
+		const init = fetchMock.mock.calls[0][1] as RequestInit;
+		expect(init.signal).toBeInstanceOf(AbortSignal);
 	});
 
 	it("returns an empty array for an invalid site URL", async () => {

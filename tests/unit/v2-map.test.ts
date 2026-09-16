@@ -1,16 +1,18 @@
 import { fromHono } from "chanfana";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getBrowser } from "../../src/browser";
 import { fetchSitemapUrls } from "../../src/crawler/sitemap";
 import type { Env } from "../../src/index";
 import { V2Map } from "../../src/v2/map";
-import { discoverLinks } from "../../src/webMap";
+import { discoverLinks, getBrowser } from "../../src/webMap";
 
-// Keep puppeteer, node-html-markdown and every network call out of the test
-// worker. The route's browser page is stubbed at the webMap boundary.
-vi.mock("../../src/browser", () => ({ getBrowser: vi.fn() }));
-vi.mock("../../src/webMap", () => ({ discoverLinks: vi.fn() }));
+// Keep puppeteer and every network call out of the test worker. The route's
+// browser surface lives on webMap (the shared v1 discovery module), so that is
+// the boundary we stub.
+vi.mock("../../src/webMap", () => ({
+	discoverLinks: vi.fn(),
+	getBrowser: vi.fn(),
+}));
 vi.mock("../../src/crawler/sitemap", () => ({ fetchSitemapUrls: vi.fn() }));
 
 function makeBrowser() {
@@ -54,9 +56,19 @@ describe("V2Map request validation", () => {
 		expect(body.success).toBe(false);
 	});
 
-	it("rejects limit above 5000", async () => {
-		const res = await post({ url: "https://example.com", limit: 5001 });
+	it("rejects an invalid url", async () => {
+		const res = await post({ url: "not-a-url" });
 		expect(res.status).toBe(400);
+	});
+
+	it("rejects limit above 100000", async () => {
+		const res = await post({ url: "https://example.com", limit: 100001 });
+		expect(res.status).toBe(400);
+	});
+
+	it("accepts limit of 6000", async () => {
+		const res = await post({ url: "https://example.com", limit: 6000 });
+		expect(res.status).toBe(200);
 	});
 
 	it("rejects an unknown sitemap mode", async () => {
@@ -67,10 +79,33 @@ describe("V2Map request validation", () => {
 		expect(res.status).toBe(400);
 	});
 
+	it("accepts a location object", async () => {
+		const res = await post({
+			url: "https://example.com",
+			location: { country: "US", languages: ["en"] },
+		});
+		expect(res.status).toBe(200);
+	});
+
+	it("rejects a string location (search route form does not apply)", async () => {
+		const res = await post({ url: "https://example.com", location: "US" });
+		expect(res.status).toBe(400);
+	});
+
+	it("rejects a location country that is not an ISO alpha-2 code", async () => {
+		const res = await post({
+			url: "https://example.com",
+			location: { country: "usa" },
+		});
+		expect(res.status).toBe(400);
+	});
+
 	it("accepts a url-only request and defaults sitemap to include", async () => {
 		const res = await post({ url: "https://example.com" });
 		expect(res.status).toBe(200);
-		expect(fetchSitemapUrls).toHaveBeenCalledTimes(1);
+		expect(fetchSitemapUrls).toHaveBeenCalledWith("https://example.com", {
+			limit: 5000,
+		});
 	});
 });
 
@@ -123,9 +158,7 @@ describe("V2Map sitemap modes", () => {
 		});
 		const body = await res.json();
 
-		expect(body.links).toEqual([
-			{ url: "https://example.com/from-sitemap" },
-		]);
+		expect(body.links).toEqual([{ url: "https://example.com/from-sitemap" }]);
 		expect(fetchSitemapUrls).toHaveBeenCalledWith("https://example.com", {
 			limit: 5000,
 		});
@@ -168,9 +201,7 @@ describe("V2Map sitemap modes", () => {
 	});
 
 	it("ignores query strings for dedupe but keeps the original URL", async () => {
-		vi.mocked(discoverLinks).mockResolvedValue([
-			"https://example.com/p?x=1",
-		]);
+		vi.mocked(discoverLinks).mockResolvedValue(["https://example.com/p?x=1"]);
 		vi.mocked(fetchSitemapUrls).mockResolvedValue([
 			"https://example.com/p?x=2",
 		]);
@@ -184,9 +215,7 @@ describe("V2Map sitemap modes", () => {
 	});
 
 	it("keeps query-distinct URLs when ignoreQueryParameters is false", async () => {
-		vi.mocked(discoverLinks).mockResolvedValue([
-			"https://example.com/p?x=1",
-		]);
+		vi.mocked(discoverLinks).mockResolvedValue(["https://example.com/p?x=1"]);
 		vi.mocked(fetchSitemapUrls).mockResolvedValue([
 			"https://example.com/p?x=2",
 		]);
@@ -240,17 +269,18 @@ describe("V2Map sitemap modes", () => {
 	});
 });
 
-describe("V2Map browser failure handling", () => {
+describe("V2Map discovery semantics", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
 		vi.mocked(discoverLinks).mockResolvedValue([]);
 		vi.mocked(fetchSitemapUrls).mockResolvedValue([]);
 	});
 
-	it("falls back to sitemap-only results when the browser fails", async () => {
-		vi.mocked(getBrowser).mockRejectedValue(new Error("launch failed"));
+	it("merges sitemap results when browser discovery returns no links", async () => {
+		vi.mocked(getBrowser).mockResolvedValue(makeBrowser() as never);
+		vi.mocked(discoverLinks).mockResolvedValue([]);
 		vi.mocked(fetchSitemapUrls).mockResolvedValue([
-			"https://example.com/sitemap-only",
+			"https://example.com/from-sitemap",
 		]);
 		const res = await post({
 			url: "https://example.com",
@@ -260,26 +290,42 @@ describe("V2Map browser failure handling", () => {
 
 		expect(res.status).toBe(200);
 		expect(body.success).toBe(true);
-		expect(body.links).toEqual([
-			{ url: "https://example.com/sitemap-only" },
-		]);
+		expect(body.links).toEqual([{ url: "https://example.com/from-sitemap" }]);
+		expect(body.warning).toBeUndefined();
 	});
 
-	it("returns 500 when the browser fails and the sitemap is skipped", async () => {
-		vi.mocked(getBrowser).mockRejectedValue(new Error("launch failed"));
+	it("returns 200 with an empty list and a warning when discovery and sitemap are both empty", async () => {
+		vi.mocked(getBrowser).mockResolvedValue(makeBrowser() as never);
+		vi.mocked(discoverLinks).mockResolvedValue([]);
+		vi.mocked(fetchSitemapUrls).mockResolvedValue([]);
+		const res = await post({
+			url: "https://example.com",
+			sitemap: "include",
+		});
+		const body = await res.json();
+
+		expect(res.status).toBe(200);
+		expect(body.success).toBe(true);
+		expect(body.links).toEqual([]);
+		expect(body.warning).toBe("browser discovery returned no links");
+	});
+
+	it("warns for empty discovery under sitemap=skip too", async () => {
+		vi.mocked(getBrowser).mockResolvedValue(makeBrowser() as never);
+		vi.mocked(discoverLinks).mockResolvedValue([]);
 		const res = await post({
 			url: "https://example.com",
 			sitemap: "skip",
 		});
 		const body = await res.json();
 
-		expect(res.status).toBe(500);
-		expect(body).toEqual({ success: false, error: "Map failed" });
+		expect(res.status).toBe(200);
+		expect(body.links).toEqual([]);
+		expect(body.warning).toBe("browser discovery returned no links");
 	});
 
-	it("returns 500 when discovery throws and the sitemap produced nothing", async () => {
-		vi.mocked(getBrowser).mockResolvedValue(makeBrowser() as never);
-		vi.mocked(discoverLinks).mockRejectedValue(new Error("navigation failed"));
+	it("returns 500 only when getBrowser launch throws", async () => {
+		vi.mocked(getBrowser).mockRejectedValue(new Error("launch failed"));
 		const res = await post({
 			url: "https://example.com",
 			sitemap: "include",
@@ -287,6 +333,77 @@ describe("V2Map browser failure handling", () => {
 		const body = await res.json();
 
 		expect(res.status).toBe(500);
-		expect(body.success).toBe(false);
+		expect(body).toEqual({ success: false, error: "Map failed" });
+	});
+});
+
+describe("V2Map search", () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+		vi.mocked(getBrowser).mockResolvedValue(makeBrowser() as never);
+		vi.mocked(discoverLinks).mockResolvedValue([]);
+		vi.mocked(fetchSitemapUrls).mockResolvedValue([]);
+	});
+
+	it("filters the full candidate set before slicing and warns", async () => {
+		vi.mocked(fetchSitemapUrls).mockResolvedValue([
+			"https://example.com/blog/1",
+			"https://example.com/other",
+			"https://example.com/blog/2",
+			"https://example.com/blog/3",
+		]);
+		const res = await post({
+			url: "https://example.com",
+			sitemap: "include",
+			search: "blog",
+			limit: 2,
+		});
+		const body = await res.json();
+
+		// Parser is asked for more than the final limit so filtering can't
+		// under-return; the two matches come from positions 1 and 3.
+		expect(fetchSitemapUrls).toHaveBeenCalledWith("https://example.com", {
+			limit: 100000,
+		});
+		expect(body.links).toEqual([
+			{ url: "https://example.com/blog/1" },
+			{ url: "https://example.com/blog/2" },
+		]);
+		expect(body.warning).toContain(
+			"search relevance ordering is not supported; results are filtered by substring",
+		);
+	});
+});
+
+describe("V2Map ignored contract fields", () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+		vi.mocked(getBrowser).mockResolvedValue(makeBrowser() as never);
+		vi.mocked(discoverLinks).mockResolvedValue(["https://example.com/page"]);
+		vi.mocked(fetchSitemapUrls).mockResolvedValue([]);
+	});
+
+	it("warns for accepted-but-ignored fields", async () => {
+		const res = await post({
+			url: "https://example.com",
+			sitemap: "skip",
+			ignoreCache: true,
+			auditMetadata: { username: "siem-user" },
+			threatProtection: { mode: "normal" },
+			timeout: 1000,
+			location: { country: "US", languages: ["en"] },
+		});
+		const body = await res.json();
+
+		expect(res.status).toBe(200);
+		expect(body.warning).toBe(
+			"unsupported fields ignored: ignoreCache, auditMetadata, threatProtection, timeout, location",
+		);
+	});
+
+	it("emits no warning when no ignored field is supplied", async () => {
+		const res = await post({ url: "https://example.com", sitemap: "skip" });
+		const body = await res.json();
+		expect(body.warning).toBeUndefined();
 	});
 });
