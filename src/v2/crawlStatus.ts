@@ -188,6 +188,8 @@ export class V2CrawlStatus extends OpenAPIRoute {
 	}
 }
 
-function notFound() {
+// Shared by every crawl route that needs the 404 envelope (`V2CrawlErrors`
+// reuses it) so the error body stays identical across the surface.
+export function notFound() {
 	return Response.json({ success: false, error: NOT_FOUND }, { status: 404 });
 }

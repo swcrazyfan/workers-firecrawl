@@ -47,6 +47,47 @@ export interface CrawlResultRow {
 	error: string | null;
 }
 
+export interface CrawlJobError {
+	id: number;
+	timestamp: number;
+	url: string;
+	error: string;
+}
+
+export interface CrawlJobErrors {
+	errors: CrawlJobError[];
+	robotsBlocked: string[];
+}
+
+export interface ActiveCrawlJob {
+	id: string;
+	url: string;
+	status: string;
+	total: number;
+	completed: number;
+	created_at: number;
+}
+
+// Read caps for the auxiliary crawl endpoints. The crawl surface is
+// intentionally pagination-free, so these are hard caps rather than cursors.
+const DEFAULT_AUX_LIMIT = 100;
+const MAX_AUX_LIMIT = 1000;
+
+// The error string the engine records for a robots.txt block. Owned here (the
+// engine imports it) so the writer and the `GET /crawl/{id}/errors` reader can
+// never drift.
+export const ROBOTS_DISALLOWED = "robots.txt disallowed";
+
+// Defensive cap resolution: a missing, non-finite or non-positive limit falls
+// back to the default, and an oversized limit is clamped. Enforced here as well
+// as in the route schema so a direct store caller cannot page without bound.
+function resolveAuxLimit(limit?: number): number {
+	if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 1) {
+		return DEFAULT_AUX_LIMIT;
+	}
+	return Math.min(Math.trunc(limit), MAX_AUX_LIMIT);
+}
+
 const JOB_COLUMNS =
 	"id, url, status, total, completed, error, created_at, updated_at, expires_at, completed_at";
 
@@ -359,4 +400,77 @@ export async function purgeExpired(
 			.bind(cutoff),
 		db.prepare("DELETE FROM crawl_jobs WHERE expires_at < ?").bind(cutoff),
 	]);
+}
+
+// Per-job failure log for `GET /crawl/{id}/errors`. `error IS NOT NULL` is
+// explicit because a `failed` row may still carry a NULL error (e.g. a network
+// failure recorded without a message); those are not reportable. Newest first
+// is ordered by the autoincrement id, matching `listResults`' id-based order.
+export async function listJobErrors(
+	db: D1Database,
+	jobId: string,
+	limit?: number,
+): Promise<CrawlJobErrors> {
+	const cap = resolveAuxLimit(limit);
+
+	const errorRows = await db
+		.prepare(
+			`SELECT id, created_at, url, error FROM crawl_results
+			 WHERE job_id = ? AND status = 'failed' AND error IS NOT NULL
+			 ORDER BY id DESC LIMIT ?`,
+		)
+		.bind(jobId, cap)
+		.all<{ id: number; created_at: number; url: string; error: string }>();
+
+	// Distinct, so a URL the engine retried stays a single entry. The
+	// `status = 'failed'` filter matches the `errors` query above and keeps a
+	// non-failed row that merely mentions the robots string out of the list.
+	// Deliberately overlaps the `errors` list: a robots-disallowed page is both
+	// a reported error and a robots block.
+	const robotsRows = await db
+		.prepare(
+			`SELECT DISTINCT url FROM crawl_results
+			 WHERE job_id = ? AND status = 'failed' AND error = ?
+			 ORDER BY url ASC LIMIT ?`,
+		)
+		.bind(jobId, ROBOTS_DISALLOWED, cap)
+		.all<{ url: string }>();
+
+	return {
+		errors: (errorRows.results ?? []).map((row) => ({
+			id: row.id,
+			timestamp: row.created_at,
+			url: row.url,
+			error: row.error,
+		})),
+		robotsBlocked: (robotsRows.results ?? []).map((row) => row.url),
+	};
+}
+
+// Active jobs for `GET /crawl/active`: still-scraping rows whose retention
+// window has not elapsed, oldest first (id breaks `created_at` ties so the
+// order is deterministic when rows share a millisecond).
+export async function listActiveJobs(
+	db: D1Database,
+	now: number,
+	limit?: number,
+): Promise<ActiveCrawlJob[]> {
+	const cap = resolveAuxLimit(limit);
+	const { results } = await db
+		.prepare(
+			`SELECT id, url, status, total, completed, created_at FROM crawl_jobs
+			 WHERE status = 'scraping' AND expires_at > ?
+			 ORDER BY created_at ASC, id ASC LIMIT ?`,
+		)
+		.bind(now, cap)
+		.all<ActiveCrawlJob>();
+
+	return (results ?? []).map((row) => ({
+		id: row.id,
+		url: row.url,
+		status: row.status,
+		total: row.total,
+		completed: row.completed,
+		created_at: row.created_at,
+	}));
 }
