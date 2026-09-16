@@ -21,6 +21,8 @@ const input: SearchInput = {
 
 function makeBrowser() {
 	const page = {
+		setViewport: vi.fn().mockResolvedValue(undefined),
+		setUserAgent: vi.fn().mockResolvedValue(undefined),
 		goto: vi.fn().mockResolvedValue(null),
 		waitForSelector: vi.fn().mockResolvedValue(undefined),
 		evaluate: vi.fn().mockResolvedValue([]),

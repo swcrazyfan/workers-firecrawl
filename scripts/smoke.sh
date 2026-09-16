@@ -150,7 +150,7 @@ else:
 fi
 
 # 5. Map (links must be an array of objects, not strings).
-send POST /v2/map '{"url":"https://example.com"}' 1
+send POST /v2/map '{"url":"https://example.github.io/"}' 1
 if expect_status "map: HTTP 200" 200; then
 	expect_json "map: links is a non-empty array of objects" '
 import json, sys
@@ -165,7 +165,7 @@ fi
 
 # 6. Crawl: start a small job and poll to a terminal status.
 CRAWL_ID=""
-send POST /v2/crawl '{"url":"https://example.com","limit":2}' 1
+send POST /v2/crawl '{"url":"https://example.github.io/","limit":2}' 1
 if expect_status "crawl create: HTTP 200" 200; then
 	expect_json "crawl create: top-level success, id, url" '
 import json, sys
