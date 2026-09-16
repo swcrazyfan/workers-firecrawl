@@ -71,8 +71,8 @@ docs/specs/              # per-task implementation specs (agents read these)
 | 006 | ✅ `/v2/search` route (PR #8) | `src/v2/search.ts`, `src/index.ts` | 005 | 2 |
 | 008 | ✅ `/v2/map` route + sitemap parser (PR #10) | `src/v2/map.ts`, `src/crawler/sitemap.ts` | — | 3 |
 | 009 | ✅ `/v2/scrape` format objects (PR #9) | `src/v2/scrape.ts` | — | 3 |
-| 010a | AI: types/config/provider iface + OpenAI-compat | `src/ai/*` partial | — | 4 |
-| 010b | AI: Workers AI provider | `src/ai/workersAiProvider.ts` | 010a | 4 |
+| 010a | ✅ AI core: config + provider seam + OpenAI-compat (PR #11) | `src/ai/*` | — | 4 |
+| 010b | ✅ AI: Workers AI provider (PR #12) | `src/ai/workersAiProvider.ts` | 010a | 4 |
 | 010c | AI: extract pipeline + prompts + scrape wiring | `src/ai/extract.ts`, `prompt.ts`, `src/v2/scrape.ts` | 010a/b, 009 | 4 |
 | 010 | robots + sitemap utils | `src/crawler/robots.ts`, `src/crawler/sitemap.ts` | — | 3 |
 | 011 | D1 schema + crawl endpoints | `migrations/`, `src/v2/crawl*.ts` | — | 4 |
