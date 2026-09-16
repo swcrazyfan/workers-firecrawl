@@ -130,9 +130,21 @@ print("%d web results" % len(web))
 '
 fi
 
-# 4. Search news (DDG news may be blocked from Workers egress).
-send POST /v2/search '{"query":"cloudflare workers","limit":3,"sources":["news"]}' 1
-if expect_status "search news: HTTP 200" 200; then
+# 4. Search news (DDG news is intermittently rate-limited per egress IP —
+#    retry a few times before declaring failure; a persistent 503 means the
+#    provider chain found no usable backend for the news source).
+NEWS_ATTEMPTS=0
+NEWS_OK=0
+while [ "$NEWS_ATTEMPTS" -lt 3 ]; do
+	NEWS_ATTEMPTS=$((NEWS_ATTEMPTS + 1))
+	send POST /v2/search '{"query":"cloudflare workers","limit":3,"sources":["news"]}' 1
+	if expect_status "search news: HTTP 200 (attempt $NEWS_ATTEMPTS)" 200; then
+		NEWS_OK=1
+		break
+	fi
+	sleep 5
+done
+if [ "$NEWS_OK" -eq 1 ]; then
 	expect_json "search news: news results or a warning" '
 import json, sys
 d = json.load(open(sys.argv[1]))
