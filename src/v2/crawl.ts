@@ -13,18 +13,24 @@ const JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // caller gets a 503 instead of a job that never progresses.
 const ENGINE_NOT_CONFIGURED = "crawl engine not configured";
 
+// Raised when D1 rejects the job row or the seed enqueue. The job never reaches
+// a runnable state, so the caller gets a structured 500 instead of a bare
+// runtime error with the row stuck in `scraping`.
+const CREATION_ERROR = "crawl job could not be created";
+
 // v2 crawl fields this deployment validates for SDK compatibility but does not
 // act on. `handle` reports them through the response `warning`.
 const IGNORED_FIELDS = [
 	"crawlEntireDomain",
 	"delay",
+	"ignoreQueryParameters",
+	"excludeTags",
+	"includeTags",
 	"maxConcurrency",
+	"prompt",
 	"regexOnFullURL",
 	"robotsUserAgent",
 	"zeroDataRetention",
-	"prompt",
-	"excludeTags",
-	"includeTags",
 ] as const;
 
 // `crawl_<epochms>_<8 hex chars>`; the id doubles as the Workflow instance id.
@@ -55,20 +61,34 @@ export class V2Crawl extends OpenAPIRoute {
 							maxDiscoveryDepth: z.number().int().min(0).max(10).optional(),
 							allowExternalLinks: z.boolean().default(false).optional(),
 							allowSubdomains: z.boolean().default(false).optional(),
-							includePaths: z.string().array().optional(),
-							excludePaths: z.string().array().optional(),
+							// Contract bounds: each entry at most 2000 chars, at most 1000
+							// entries per field.
+							includePaths: z.string().max(2000).array().max(1000).optional(),
+							excludePaths: z.string().max(2000).array().max(1000).optional(),
 							ignoreRobotsTxt: z.boolean().default(false).optional(),
 							sitemap: z
 								.enum(["skip", "include", "only"])
 								.default("include")
 								.optional(),
+							// Only `formats` is implemented; `.passthrough()` keeps any
+							// other scrape sub-field so `handle` can name it in the warning.
 							scrapeOptions: z
 								.object({ formats: z.array(scrapeFormatSchema).optional() })
+								.passthrough()
 								.optional(),
-							webhook: z.string().url().optional(),
+							// Contract of record: `webhook` is an object (url required).
+							webhook: z
+								.object({
+									url: z.string().url(),
+									headers: z.record(z.string()).optional(),
+									metadata: z.record(z.unknown()).optional(),
+									events: z.string().array().optional(),
+								})
+								.optional(),
 							// Accepted-and-ignored: see IGNORED_FIELDS.
 							crawlEntireDomain: z.boolean().optional(),
 							delay: z.number().optional(),
+							ignoreQueryParameters: z.boolean().default(false).optional(),
 							maxConcurrency: z.number().int().optional(),
 							regexOnFullURL: z.boolean().optional(),
 							robotsUserAgent: z.string().optional(),
@@ -89,6 +109,13 @@ export class V2Crawl extends OpenAPIRoute {
 					id: z.string(),
 					url: z.string(),
 					warning: z.string().optional(),
+				}),
+			},
+			500: {
+				description: "Crawl job could not be created",
+				...contentJson({
+					success: z.literal(false),
+					error: z.string(),
 				}),
 			},
 			503: {
@@ -121,16 +148,34 @@ export class V2Crawl extends OpenAPIRoute {
 			sitemap: body.sitemap ?? "include",
 		};
 
-		// The job and its seed URL are persisted before enqueueing so a failed
-		// enqueue still leaves an inspectable, failed job row.
-		await createJob(c.env.DB, {
-			id: jobId,
-			url: body.url,
-			options,
-			now,
-			expiresAt,
-		});
-		await enqueueUrls(c.env.DB, jobId, [{ url: body.url, depth: 0 }], now);
+		// The job row is the anchor for every later step: if it cannot be written
+		// there is nothing to mark failed, so fail loudly with a structured error.
+		try {
+			await createJob(c.env.DB, {
+				id: jobId,
+				url: body.url,
+				options,
+				now,
+				expiresAt,
+			});
+		} catch (error) {
+			console.error(
+				`Crawl job creation failed for ${jobId}: ${(error as Error).message}`,
+			);
+			return creationFailed();
+		}
+
+		// The row exists now, so a failed seed enqueue is recoverable: mark the job
+		// failed so it is never left stuck in `scraping`, then surface the error.
+		try {
+			await enqueueUrls(c.env.DB, jobId, [{ url: body.url, depth: 0 }], now);
+		} catch (error) {
+			console.error(
+				`Crawl seed enqueue failed for ${jobId}: ${(error as Error).message}`,
+			);
+			await markJobFailed(c.env.DB, jobId, CREATION_ERROR, now);
+			return creationFailed();
+		}
 
 		try {
 			const workflow = c.env.CRAWL_WORKFLOW;
@@ -152,9 +197,23 @@ export class V2Crawl extends OpenAPIRoute {
 			);
 		}
 
-		const ignored = IGNORED_FIELDS.filter(
+		const ignored: string[] = IGNORED_FIELDS.filter(
 			(field) => (body as Record<string, unknown>)[field] !== undefined,
 		);
+
+		// `scrapeOptions` is only honoured for `formats`; name any other sub-field
+		// it carried so callers are not misled into thinking it took effect.
+		const scrapeOptions = body.scrapeOptions as
+			| Record<string, unknown>
+			| undefined;
+		if (scrapeOptions) {
+			for (const key of Object.keys(scrapeOptions)) {
+				if (key !== "formats") {
+					ignored.push(`scrapeOptions.${key}`);
+				}
+			}
+		}
+		ignored.sort();
 
 		const payload: {
 			success: true;
@@ -170,5 +229,29 @@ export class V2Crawl extends OpenAPIRoute {
 			payload.warning = `unsupported fields ignored: ${ignored.join(", ")}`;
 		}
 		return payload;
+	}
+}
+
+function creationFailed() {
+	return Response.json(
+		{ success: false, error: CREATION_ERROR },
+		{ status: 500 },
+	);
+}
+
+// Best-effort failure marking: if D1 is unavailable this may also throw, but the
+// caller must still receive the structured 500 rather than a second stack trace.
+async function markJobFailed(
+	db: D1Database,
+	jobId: string,
+	error: string,
+	now: number,
+): Promise<void> {
+	try {
+		await setJobStatus(db, jobId, "failed", { error, completedAt: now });
+	} catch (markError) {
+		console.error(
+			`Crawl job ${jobId} could not be marked failed: ${(markError as Error).message}`,
+		);
 	}
 }

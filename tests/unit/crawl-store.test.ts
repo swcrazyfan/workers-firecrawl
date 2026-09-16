@@ -208,7 +208,12 @@ describe("crawl store: queue", () => {
 		expect(claiming.count).toBe(5);
 	});
 
-	it("never hands the same row to concurrent claimers", async () => {
+	// D1 serializes statements per database, so this does not prove contention
+	// safety (there is no true parallelism to contend with). What it does prove
+	// is next-batch ordering: whichever claim runs second sees the first batch
+	// already flipped to `processing` and returns the following rows, never a
+	// duplicate.
+	it("hands disjoint next batches to overlapping claimers", async () => {
 		await createJob(env.DB, newJob("job-concurrent"));
 		await enqueueUrls(
 			env.DB,

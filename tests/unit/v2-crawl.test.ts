@@ -77,13 +77,31 @@ interface WorkflowMock {
 }
 
 // Bindings come from the real test env (D1); the optional Workflow binding is
-// layered on top so both "configured" and "absent" cases are exercisable.
-function makeEnv(workflow?: WorkflowMock | null): Env {
+// layered on top so both "configured" and "absent" cases are exercisable. A
+// caller may also swap in a partially failing `DB` to exercise D1 error paths.
+function makeEnv(workflow?: WorkflowMock | null, db?: D1Database): Env {
 	const testEnv = { ...env } as unknown as Env;
 	if (workflow) {
 		testEnv.CRAWL_WORKFLOW = workflow as unknown as Env["CRAWL_WORKFLOW"];
 	}
+	if (db) {
+		testEnv.DB = db;
+	}
 	return testEnv;
+}
+
+// Minimal D1 stand-in that forwards to the real test database but throws from
+// `prepare` for statements matching `match`, simulating a D1 failure at a
+// specific step without mocking the whole store module.
+function failingDb(match: (sql: string) => boolean): D1Database {
+	const real = env.DB;
+	return {
+		prepare: (sql: string) => {
+			if (match(sql)) throw new Error("d1 unavailable");
+			return real.prepare(sql);
+		},
+		batch: (statements: D1PreparedStatement[]) => real.batch(statements),
+	} as unknown as D1Database;
 }
 
 function workflowMock(): WorkflowMock {
@@ -180,6 +198,38 @@ describe("POST /v2/crawl", () => {
 		expect(res.status).toBe(200);
 	});
 
+	it("accepts a webhook object per the contract", async () => {
+		const res = await postCrawl(
+			{
+				url: SEED,
+				webhook: {
+					url: "https://hooks.example.com/crawl",
+					headers: { Authorization: "Bearer token" },
+					metadata: { tenant: "acme" },
+					events: ["completed", "page"],
+				},
+			},
+			makeEnv(workflowMock()),
+		);
+		expect(res.status).toBe(200);
+	});
+
+	it("rejects a bare-string webhook", async () => {
+		const res = await postCrawl(
+			{ url: SEED, webhook: "https://hooks.example.com/crawl" },
+			makeEnv(workflowMock()),
+		);
+		expect(res.status).toBe(400);
+	});
+
+	it("rejects a webhook object without a url", async () => {
+		const res = await postCrawl(
+			{ url: SEED, webhook: { events: ["completed"] } },
+			makeEnv(workflowMock()),
+		);
+		expect(res.status).toBe(400);
+	});
+
 	it("returns 400 for an unknown format", async () => {
 		const res = await postCrawl(
 			{ url: SEED, scrapeOptions: { formats: ["nope"] } },
@@ -216,6 +266,34 @@ describe("POST /v2/crawl", () => {
 		).toBe(400);
 	});
 
+	it("bounds includePaths and excludePaths per the contract", async () => {
+		const long = "a".repeat(2001);
+		expect(
+			(
+				await postCrawl(
+					{ url: SEED, includePaths: [long] },
+					makeEnv(workflowMock()),
+				)
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postCrawl(
+					{ url: SEED, excludePaths: Array(1001).fill("ok") },
+					makeEnv(workflowMock()),
+				)
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postCrawl(
+					{ url: SEED, includePaths: ["blog/.*"], excludePaths: ["admin/.*"] },
+					makeEnv(workflowMock()),
+				)
+			).status,
+		).toBe(200);
+	});
+
 	it("marks the job failed and returns 503 when the binding is absent", async () => {
 		const res = await postCrawl({ url: SEED }, makeEnv());
 		expect(res.status).toBe(503);
@@ -250,15 +328,79 @@ describe("POST /v2/crawl", () => {
 		});
 	});
 
-	it("warns about accepted-and-ignored fields", async () => {
+	it("returns a structured 500 and creates no row when the job insert fails", async () => {
+		const db = failingDb((sql) => sql.includes("INSERT INTO crawl_jobs"));
 		const res = await postCrawl(
-			{ url: SEED, maxConcurrency: 3, delay: 1 },
+			{ url: SEED },
+			makeEnv(workflowMock(), db),
+		);
+		expect(res.status).toBe(500);
+		expect(await res.json()).toEqual({
+			success: false,
+			error: "crawl job could not be created",
+		});
+
+		const jobs = await env.DB.prepare(
+			"SELECT COUNT(*) AS count FROM crawl_jobs",
+		).first<{ count: number }>();
+		expect(jobs.count).toBe(0);
+	});
+
+	it("marks the job failed and returns 500 when the seed enqueue fails", async () => {
+		const db = failingDb((sql) =>
+			sql.includes("INSERT OR IGNORE INTO crawl_queue"),
+		);
+		const workflow = workflowMock();
+		const res = await postCrawl({ url: SEED }, makeEnv(workflow, db));
+		expect(res.status).toBe(500);
+		expect(await res.json()).toEqual({
+			success: false,
+			error: "crawl job could not be created",
+		});
+		// The engine is never asked to run a job that has no seed.
+		expect(workflow.create).not.toHaveBeenCalled();
+
+		const row = await env.DB.prepare(
+			"SELECT status, error, completed_at FROM crawl_jobs",
+		).first<{
+			status: string;
+			error: string;
+			completed_at: number | null;
+		}>();
+		expect(row).not.toBeNull();
+		expect(row.status).toBe("failed");
+		expect(row.error).toBe("crawl job could not be created");
+		expect(row.completed_at).toEqual(expect.any(Number));
+	});
+
+	it("warns about accepted-and-ignored fields including ignoreQueryParameters", async () => {
+		const res = await postCrawl(
+			{ url: SEED, maxConcurrency: 3, delay: 1, ignoreQueryParameters: true },
 			makeEnv(workflowMock()),
 		);
 		expect(res.status).toBe(200);
 		const body = await res.json();
 		expect(body.warning).toBe(
-			"unsupported fields ignored: delay, maxConcurrency",
+			"unsupported fields ignored: delay, ignoreQueryParameters, maxConcurrency",
+		);
+	});
+
+	it("names unhandled scrapeOptions sub-fields in the warning", async () => {
+		const res = await postCrawl(
+			{
+				url: SEED,
+				scrapeOptions: {
+					formats: ["markdown"],
+					onlyMainContent: true,
+					waitFor: 500,
+				},
+			},
+			makeEnv(workflowMock()),
+		);
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.warning).toBe(
+			"unsupported fields ignored: scrapeOptions.onlyMainContent, scrapeOptions.waitFor",
 		);
 	});
 });
@@ -298,11 +440,16 @@ describe("GET /v2/crawl/:id", () => {
 			total: 1,
 			completed: 1,
 			creditsUsed: 0,
-			expiresAt: NOW + 1000,
-			createdAt: NOW,
-			completedAt: NOW + 20,
+			expiresAt: new Date(NOW + 1000).toISOString(),
+			createdAt: new Date(NOW).toISOString(),
+			completedAt: new Date(NOW + 20).toISOString(),
+			duration: 0.02,
 			next: null,
 		});
+		// Timestamps are ISO-8601 date-time strings, not epoch millis.
+		for (const field of ["createdAt", "completedAt", "expiresAt"] as const) {
+			expect(body[field]).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+		}
 		expect(body.data).toHaveLength(1);
 		expect(body.data[0]).toMatchObject({
 			url: `${SEED}/job-shape`,
@@ -343,8 +490,11 @@ describe("GET /v2/crawl/:id", () => {
 			{ method: "GET" },
 			makeEnv(),
 		);
-		const { data } = await res.json();
-		expect(Object.keys(data[0]).sort()).toEqual(["status", "url"]);
+		const body = await res.json();
+		expect(Object.keys(body.data[0]).sort()).toEqual(["status", "url"]);
+		// Still scraping: no completedAt and therefore no duration yet.
+		expect(body.completedAt).toBeNull();
+		expect(body.duration).toBeNull();
 	});
 
 	it("paginates with a relative next link", async () => {
@@ -382,14 +532,63 @@ describe("GET /v2/crawl/:id", () => {
 		expect(secondBody.next).toBeNull();
 	});
 
+	it("follows next to termination with no duplicates or skips", async () => {
+		await seedJob("job-walk", "scraping");
+		const expected: string[] = [];
+		for (let i = 1; i <= 7; i++) {
+			const url = `${SEED}/walk-${i}`;
+			expected.push(url);
+			await insertResult(env.DB, {
+				jobId: "job-walk",
+				url,
+				status: "completed",
+				now: NOW + i,
+			});
+		}
+
+		const seen: string[] = [];
+		let next: string | null = "/v2/crawl/job-walk?limit=2";
+		let pages = 0;
+		while (next) {
+			pages++;
+			expect(pages).toBeLessThanOrEqual(expected.length + 1);
+			const res: Response = await createApp().request(
+				next,
+				{ method: "GET" },
+				makeEnv(),
+			);
+			expect(res.status).toBe(200);
+			const body = await res.json();
+			seen.push(...body.data.map((item: { url: string }) => item.url));
+			next = body.next;
+		}
+
+		expect(pages).toBe(4);
+		expect(seen).toEqual(expected);
+		expect(new Set(seen).size).toBe(expected.length);
+	});
+
 	it("defaults limit to 50 and enforces the 200 cap", async () => {
 		await seedJob("job-limit", "scraping");
+		for (let i = 1; i <= 55; i++) {
+			await insertResult(env.DB, {
+				jobId: "job-limit",
+				url: `${SEED}/limit-${i}`,
+				status: "completed",
+				now: NOW + i,
+			});
+		}
+
 		const ok = await createApp().request(
 			"/v2/crawl/job-limit",
 			{ method: "GET" },
 			makeEnv(),
 		);
 		expect(ok.status).toBe(200);
+		const body = await ok.json();
+		// 55 rows stored, but the default page is capped at 50 and offers a next.
+		expect(body.data).toHaveLength(50);
+		expect(body.next).toMatch(/^\/v2\/crawl\/job-limit\?skip=\d+&limit=50$/);
 
 		expect(
 			(

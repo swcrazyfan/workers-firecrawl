@@ -12,6 +12,15 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 const NOT_FOUND = "crawl job not found";
 
+// Result statuses are constrained to the crawl status enum rather than a bare
+// string so the OpenAPI response schema cannot drift from the job status set.
+const resultStatusSchema = z.enum([
+	"scraping",
+	"completed",
+	"failed",
+	"cancelled",
+]);
+
 const dataItemSchema = z.object({
 	url: z.string(),
 	markdown: z.string().optional(),
@@ -20,7 +29,7 @@ const dataItemSchema = z.object({
 	links: z.string().array().optional(),
 	metadata: z.unknown().optional(),
 	json: z.unknown().optional(),
-	status: z.string(),
+	status: resultStatusSchema,
 	error: z.string().optional(),
 });
 
@@ -29,7 +38,7 @@ const dataItemSchema = z.object({
 function toDataItem(row: CrawlResultRow): z.infer<typeof dataItemSchema> {
 	const item: z.infer<typeof dataItemSchema> = {
 		url: row.url,
-		status: row.status,
+		status: row.status as z.infer<typeof resultStatusSchema>,
 	};
 	if (row.markdown !== null) item.markdown = row.markdown;
 	if (row.html !== null) item.html = row.html;
@@ -66,9 +75,12 @@ export class V2CrawlStatus extends OpenAPIRoute {
 							total: z.number(),
 							completed: z.number(),
 							creditsUsed: z.literal(0),
-							expiresAt: z.number(),
-							createdAt: z.number(),
-							completedAt: z.number().nullable(),
+							// Contract of record: timestamps are ISO-8601 `date-time`
+							// strings at the response boundary (D1 keeps epoch millis).
+							expiresAt: z.string(),
+							createdAt: z.string(),
+							completedAt: z.string().nullable(),
+							duration: z.number().nullable(),
 							data: z.array(dataItemSchema),
 							next: z.string().nullable(),
 						}),
@@ -131,9 +143,20 @@ export class V2CrawlStatus extends OpenAPIRoute {
 			// Self-hosted: no credit metering exists, so this is always the real
 			// value (0) rather than a fabricated estimate. Kept for contract shape.
 			creditsUsed: 0,
-			expiresAt: job.expires_at,
-			createdAt: job.created_at,
-			completedAt: job.completed_at,
+			expiresAt: new Date(job.expires_at).toISOString(),
+			createdAt: new Date(job.created_at).toISOString(),
+			completedAt:
+				job.completed_at === null
+					? null
+					: new Date(job.completed_at).toISOString(),
+			// Elapsed seconds derived from the stored row: terminal jobs use the
+			// recorded completedAt. A job still `scraping` has no completedAt yet,
+			// so duration is null rather than a wall-clock value that would change
+			// on every poll of the same, still-running crawl.
+			duration:
+				job.completed_at === null
+					? null
+					: (job.completed_at - job.created_at) / 1000,
 			data: page.map(toDataItem),
 			next,
 		};
