@@ -63,13 +63,17 @@ No route concerns here; pure/testable, D1 access in the repo's
 ### 3. `src/authorization.ts` — accept master OR stored key
 
 Order of checks:
-1. Neither `AUTHORIZATION_KEY` nor `ADMIN_KEY` configured → allow (preserves
-   today's open-mode behavior and the existing tests).
-2. Bearer equals the master (`ADMIN_KEY ?? AUTHORIZATION_KEY`) → allow
-   (constant-time).
+1. Neither `AUTHORIZATION_KEY` nor `ADMIN_KEY` configured (empty/whitespace
+   counts as unset) → allow (preserves today's open-mode behavior and the
+   existing tests).
+2. Bearer equals **either** configured secret — `ADMIN_KEY` **and**
+   `AUTHORIZATION_KEY` are both accepted as API masters, constant-time. This
+   is deliberate: setting `ADMIN_KEY` must not lock out existing
+   `AUTHORIZATION_KEY` clients (Hermes keeps working).
 3. Bearer starts with `wfc-` and `env.DB` exists → `findActiveApiKey`; on a
-   hit, allow and best-effort touch `last_used_at` (via
-   `c.executionCtx.waitUntil` when available, otherwise fire-and-forget).
+   hit, allow and best-effort touch `last_used_at` (`waitUntil` when an
+   execution context exists, awaited otherwise so the write is never a
+   floating promise).
 4. Otherwise 401 `{ success: false, error: "Unauthorized: Invalid token" }`.
 
 `AUTHORIZATION_KEY` keeps working unchanged, so Hermes and the current
@@ -77,10 +81,10 @@ deployment config are unaffected.
 
 ### 4. New `src/v2/keys.ts` — admin routes
 
-Admin gate: bearer must equal `ADMIN_KEY ?? AUTHORIZATION_KEY`
-(constant-time); when neither is configured the routes stay open (consistent
-with open mode). A D1-backed key that passed the global middleware gets
-**403** `Forbidden: admin key required` here.
+Admin gate: bearer must equal `ADMIN_KEY` when configured, otherwise
+`AUTHORIZATION_KEY` (constant-time); when neither is configured the routes
+stay open (consistent with open mode). A D1-backed key that passed the global
+middleware gets **403** `Forbidden: admin key required` here.
 
 - `POST /v2/keys` — body `{ name?: string(≤100), expiresInDays?: int 1..3650 }`
   → `201 { success: true, data: { id, key, name?, prefix, createdAt,

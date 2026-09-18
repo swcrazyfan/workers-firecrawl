@@ -6,7 +6,7 @@
 
 const KEY_PREFIX = "wfc-";
 const TOKEN_BYTES = 32;
-const ID_BYTES = 6; // 12 hex chars
+const ID_BYTES = 8; // 16 hex chars — wide enough that collisions are a non-issue
 
 export interface ApiKeyRecord {
 	id: string;
@@ -142,7 +142,7 @@ function toListed(record: ApiKeyRecord): ListedApiKey {
 export async function listApiKeys(db: D1Database): Promise<ListedApiKey[]> {
 	const result = await db
 		.prepare(
-			"SELECT id, key_hash, prefix, name, created_at, last_used_at, expires_at, revoked_at FROM api_keys ORDER BY created_at DESC",
+			"SELECT id, key_hash, prefix, name, created_at, last_used_at, expires_at, revoked_at FROM api_keys ORDER BY created_at DESC, id DESC",
 		)
 		.all<ApiKeyRecord>();
 	return (result.results ?? []).map(toListed);

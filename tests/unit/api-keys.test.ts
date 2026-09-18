@@ -11,6 +11,7 @@ import {
 	revokeApiKey,
 	timingSafeEqual,
 } from "../../src/apiKeys";
+import { authorizationMiddleware } from "../../src/authorization";
 import type { Env } from "../../src/index";
 import { V2KeysCreate, V2KeysList, V2KeysRevoke } from "../../src/v2/keys";
 
@@ -81,8 +82,11 @@ describe("api key store", () => {
 		expect(mine?.name).toBe("hermes");
 		expect(mine?.prefix).toBe(created.prefix);
 		expect(mine?.revokedAt).toBeUndefined();
-		// The list must never expose the secret or its hash.
+		// The list must never expose the secret OR its hash.
 		expect(JSON.stringify(listed)).not.toContain(created.key);
+		expect(JSON.stringify(listed)).not.toContain(await hashToken(created.key));
+		expect(mine).not.toHaveProperty("key_hash");
+		expect(mine).not.toHaveProperty("key");
 
 		expect(await findActiveApiKey(env.DB, created.key)).toEqual({
 			id: created.id,
@@ -146,6 +150,10 @@ describe("api key routes", () => {
 			true,
 		);
 		expect(JSON.stringify(listBody)).not.toContain(body.data.key);
+		expect(JSON.stringify(listBody)).not.toContain(
+			await hashToken(body.data.key),
+		);
+		expect(listBody.data[0]).not.toHaveProperty("key_hash");
 	});
 
 	it("revokes a key and reports unknown ids", async () => {
@@ -194,5 +202,61 @@ describe("api key routes", () => {
 		expect(
 			(await call("GET", "/v2/keys", { token: MASTER, bindings })).status,
 		).toBe(403);
+	});
+});
+
+// The real request chain: the global middleware runs first, then the route's
+// own admin gate. These cases pin the interaction the unit routes cannot see.
+describe("api key routes behind the auth middleware", () => {
+	function createFullApp() {
+		const hono = new Hono<{ Bindings: Env }>();
+		hono.use("*", authorizationMiddleware);
+		hono.get("/probe", (c) => c.json({ success: true }));
+		const openapi = fromHono(hono, { docs_url: "/docs" });
+		openapi.post("/v2/keys", V2KeysCreate);
+		openapi.get("/v2/keys", V2KeysList);
+		openapi.delete("/v2/keys/:id", V2KeysRevoke);
+		return hono;
+	}
+
+	async function fullCall(
+		path: string,
+		token: string | undefined,
+		bindings: Env,
+		method = "GET",
+	) {
+		return createFullApp().request(
+			path,
+			{
+				method,
+				headers: token === undefined ? {} : { Authorization: `Bearer ${token}` },
+			},
+			bindings,
+		);
+	}
+
+	it("keeps AUTHORIZATION_KEY clients working when ADMIN_KEY is set", async () => {
+		const bindings = keyedEnv({ ADMIN_KEY: "admin-secret" });
+		expect((await fullCall("/probe", MASTER, bindings)).status).toBe(200);
+		// ...but key management now requires ADMIN_KEY.
+		expect((await fullCall("/v2/keys", MASTER, bindings)).status).toBe(403);
+		expect((await fullCall("/v2/keys", "admin-secret", bindings)).status).toBe(
+			200,
+		);
+	});
+
+	it("accepts a stored key on data routes and rejects it on admin routes", async () => {
+		const created = await createApiKey(env.DB, { name: "chain-test" });
+		const bindings = keyedEnv();
+		expect((await fullCall("/probe", created.key, bindings)).status).toBe(200);
+		expect(
+			(await fullCall("/v2/keys", created.key, bindings, "POST")).status,
+		).toBe(403);
+	});
+
+	it("treats an empty ADMIN_KEY as unset instead of opening the API", async () => {
+		const bindings = keyedEnv({ ADMIN_KEY: "" });
+		expect((await fullCall("/probe", undefined, bindings)).status).toBe(401);
+		expect((await fullCall("/probe", MASTER, bindings)).status).toBe(200);
 	});
 });

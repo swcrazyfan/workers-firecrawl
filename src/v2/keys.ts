@@ -6,18 +6,20 @@ import {
 	revokeApiKey,
 	timingSafeEqual,
 } from "../apiKeys";
+import { bearerToken, configuredSecret } from "../authorization";
 import type { AppContext } from "../index";
 
-// Admin gate (spec 018): the master/admin secret opens these routes; a
-// D1-backed key that satisfied the global middleware does NOT. When no secret
-// is configured the deployment is in open mode, so the routes stay open too —
-// consistent with `authorizationMiddleware`.
+// Admin gate (spec 018): ADMIN_KEY when configured, otherwise the legacy
+// AUTHORIZATION_KEY. A D1-backed key that satisfied the global middleware does
+// NOT open these routes. When no secret is configured the deployment is in
+// open mode, so the routes stay open too — consistent with the middleware.
 async function requireAdmin(c: AppContext): Promise<Response | null> {
-	const master = c.env.ADMIN_KEY ?? c.env.AUTHORIZATION_KEY;
-	if (!master) return null;
-	const header = c.req.header("authorization") ?? "";
-	const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-	if (token !== "" && (await timingSafeEqual(token, master))) return null;
+	const admin =
+		configuredSecret(c.env.ADMIN_KEY) ??
+		configuredSecret(c.env.AUTHORIZATION_KEY);
+	if (!admin) return null;
+	const token = bearerToken(c);
+	if (token !== "" && (await timingSafeEqual(token, admin))) return null;
 	return Response.json(
 		{ success: false, error: "Forbidden: admin key required" },
 		{ status: 403 },
