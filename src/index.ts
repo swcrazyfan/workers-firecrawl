@@ -9,6 +9,7 @@ import {
 	V2CrawlParamsPreview,
 } from "./v2/crawlExtras";
 import { V2CrawlStatus } from "./v2/crawlStatus";
+import { V2KeysCreate, V2KeysList, V2KeysRevoke } from "./v2/keys";
 import { V2Map } from "./v2/map";
 import { V2Scrape } from "./v2/scrape";
 import { V2Search } from "./v2/search";
@@ -18,6 +19,7 @@ import { WebSearch } from "./webSearch";
 export type Env = {
 	BROWSER: Fetcher;
 	AUTHORIZATION_KEY?: string;
+	ADMIN_KEY?: string; // master key for /v2/keys (falls back to AUTHORIZATION_KEY)
 	DB: D1Database; // crawl storage (D1)
 	CRAWL_WORKFLOW: Workflow<{ jobId: string }>; // crawl engine (task 012)
 	SEARCH_CHAIN?: string; // comma-separated provider ids tried in order: "ddg" | "ddg-media" | "searxng" | "browser"
@@ -52,6 +54,10 @@ openapi.post("/v2/map", V2Map);
 openapi.post("/v2/search", V2Search);
 openapi.post("/v2/scrape", V2Scrape);
 openapi.post("/v2/crawl", V2Crawl);
+// API key administration (spec 018) — admin-key gated.
+openapi.post("/v2/keys", V2KeysCreate);
+openapi.get("/v2/keys", V2KeysList);
+openapi.delete("/v2/keys/:id", V2KeysRevoke);
 // Literal crawl paths MUST be registered before the parameterised `/v2/crawl/:id`
 // routes: Hono's router matches `/v2/crawl/active` against `:id` otherwise,
 // which would swallow it into the status handler.
